@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Relatórios e Cores de área
 // @namespace    http://tampermonkey.net/
-// @version      8.0
+// @version      8.1
 // @author       otowm
 // @description  Botões rápidos configuráveis, tabela dividida manhã/tarde, prontuários coloridos, seleção automática de especialidade, coloração de nomes de médicos
 // @match        https://guaruja.saudesimples.net/atendimentos_medicos_administrativo*
