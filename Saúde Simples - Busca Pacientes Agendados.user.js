@@ -4,6 +4,8 @@
 // @version      2.0
 // @description  Busca de agendas direto na tela de agendamento
 // @author       otowm
+// @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.js
+// @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.js
 // @match        https://guaruja.saudesimples.net/agendamentos*
 // @grant        GM_xmlhttpRequest
 // @connect      guaruja.saudesimples.net
