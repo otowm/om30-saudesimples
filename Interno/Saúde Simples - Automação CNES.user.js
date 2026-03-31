@@ -3,6 +3,8 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @author       otowm
+// @updateURL
+// @downloadURL 
 // @description  Busca automática CNES com popup de CPF, extração aprimorada e preenchimento de campos
 // @match        *://guaruja.saudesimples.net/profissionais/new*
 // @match        *://cnes.datasus.gov.br/pages/profissionais/consulta.jsp*
