@@ -3,8 +3,8 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @author       otowm
-// @updateURL
-// @downloadURL 
+// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
+// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
 // @description  Busca automática CNES com popup de CPF, extração aprimorada e preenchimento de campos
 // @match        *://guaruja.saudesimples.net/profissionais/new*
 // @match        *://cnes.datasus.gov.br/pages/profissionais/consulta.jsp*
