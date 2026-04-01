@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Relatórios e Cores de área
 // @namespace    http://tampermonkey.net/
-// @version      8.2
+// @version      8.3
 // @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @author       otowm
@@ -210,7 +210,7 @@
     //------------------------------------------------------------
     // PAINEL DE BOTÕES
     //------------------------------------------------------------
-    function criarPainel() {
+function criarPainel() {
         const config = loadConfig();
         const painel = document.createElement("div");
         painel.id = "atalhos-saude";
@@ -255,6 +255,35 @@
         btnConfig.onfocus = () => btnConfig.style.outline = "none";
         btnConfig.onclick = () => abrirPainelConfig();
         painel.appendChild(btnConfig);
+
+        // Botão Toggle para retrair/expandir
+        const btnToggle = document.createElement("button");
+        btnToggle.textContent = "▼";
+        btnToggle.style.background = "#666";
+        btnToggle.style.color = "white";
+        btnToggle.style.border = "none";
+        btnToggle.style.borderRadius = "50%";
+        btnToggle.style.outline = "none";
+        btnToggle.style.width = "34px";
+        btnToggle.style.height = "34px";
+        btnToggle.style.display = "flex";
+        btnToggle.style.alignItems = "center";
+        btnToggle.style.justifyContent = "center";
+        btnToggle.style.padding = "0";
+        btnToggle.style.cursor = "pointer";
+        btnToggle.style.fontWeight = "600";
+        btnToggle.style.fontSize = "16px";
+        btnToggle.style.transition = "transform 0.2s ease";
+        btnToggle.onmouseenter = () => btnToggle.style.transform = "scale(1.05)";
+        btnToggle.onmouseleave = () => btnToggle.style.transform = "scale(1)";
+        btnToggle.onfocus = () => btnToggle.style.outline = "none";
+        btnToggle.onclick = () => {
+            const containers = painel.querySelectorAll('[data-area]');
+            const isCollapsed = btnToggle.textContent === "▶";
+            containers.forEach(c => c.style.display = isCollapsed ? "flex" : "none");
+            btnToggle.textContent = isCollapsed ? "▼" : "▶";
+        };
+        painel.appendChild(btnToggle);
 
         const gruposArea = {};
         config.forEach(b => {
