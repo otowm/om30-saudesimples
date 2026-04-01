@@ -1,17 +1,15 @@
 // ==UserScript==
-// @name         Saúde Simples - Busca Pacientes Agendados
+// @name         Saúde - Simples Busca Pacientes Agendados
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Busca de agendas direto na tela de agendamento
 // @author       otowm
-// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
-// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @match        https://guaruja.saudesimples.net/agendamentos*
+// @match        https://guarujahomolog.saudesimples.net/agendamentos*
 // @grant        GM_xmlhttpRequest
 // @connect      guaruja.saudesimples.net
 // @run-at       document-start
 // ==/UserScript==
-// update test
 
 (function() {
     'use strict';
