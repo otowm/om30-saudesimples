@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Relatórios e Cores de área
 // @namespace    http://tampermonkey.net/
-// @version      8.2
+// @version      8.4
 // @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @author       otowm
