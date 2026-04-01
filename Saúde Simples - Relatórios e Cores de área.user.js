@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Relatórios e Cores de área
 // @namespace    http://tampermonkey.net/
-// @version      8.4
+// @version      8.5
 // @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @author       otowm
@@ -280,8 +280,19 @@
         btnToggle.onclick = () => {
             const containers = painel.querySelectorAll('[data-area]');
             const isCollapsed = btnToggle.textContent === "▶";
-            containers.forEach(c => c.style.display = isCollapsed ? "flex" : "none");
-            btnToggle.textContent = isCollapsed ? "▼" : "▶";
+            if (isCollapsed) {
+                containers.forEach(c => {
+                    c.style.display = "flex";
+                    setTimeout(() => c.style.transform = "translateY(0)", 10);
+                });
+                btnToggle.textContent = "▼";
+            } else {
+                containers.forEach(c => {
+                    c.style.transform = "translateY(200px)";
+                    setTimeout(() => c.style.display = "none", 300);
+                });
+                btnToggle.textContent = "▶";
+            }
         };
         painel.appendChild(btnToggle);
 
@@ -294,6 +305,8 @@
                 containerArea.style.alignItems = "center";
                 containerArea.style.margin = "0 10px";
                 containerArea.dataset.area = b.area;
+                containerArea.style.transition = "transform 0.3s ease";
+                containerArea.style.transform = "translateY(0)";
 
                 const label = document.createElement("div");
                 label.textContent = b.area;
