@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Relatórios e Cores de área
 // @namespace    http://tampermonkey.net/
-// @version      8.3
+// @version      8.2
 // @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Relat%C3%B3rios%20e%20Cores%20de%20%C3%A1rea.user.js
 // @author       otowm
@@ -210,7 +210,7 @@
     //------------------------------------------------------------
     // PAINEL DE BOTÕES
     //------------------------------------------------------------
-function criarPainel() {
+    function criarPainel() {
         const config = loadConfig();
         const painel = document.createElement("div");
         painel.id = "atalhos-saude";
@@ -538,8 +538,8 @@ function criarPainel() {
             tbody.appendChild(trTotal);
         }
 
-        criarSecao("🕗 Antes do meio-dia", linhasManha);
-        criarSecao("🌤 Depois do meio-dia", linhasTarde);
+        criarSecao("Manhã", linhasManha);
+        criarSecao("Tarde", linhasTarde);
 
         // Colorir prontuários
         const linhasParaColorir = Array.from(tbody.querySelectorAll("tr")).filter(tr => !tr.querySelector('[data-secao="dividido"]'));
