@@ -1,4 +1,4 @@
-# om30-saudesimples
+<img src="https://github.com/otowm/om30-saudesimples/blob/main/assets/OM30%20Logo.png" width="50" height="50" alt="Logo"> - **om30-saudesimples**
 
 Userscripts para uso em sistema interno.
 
