@@ -2,8 +2,8 @@
 // @name         Saúde Simples - Atualizar título + logo
 // @namespace    http://tampermonkey.net/
 // @author       @otowm
-// @downloadURL
-// @updateURL     
+// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Atualizar%20t%C3%ADtulo%20+%20logo.user.js
+// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Atualizar%20t%C3%ADtulo%20+%20logo.user.js
 // @version      1.0
 // @description  Atualiza o título da aba e o favicon conforme o conteúdo da tela
 // @match        https://*.saudesimples.net/*
