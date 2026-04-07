@@ -19,6 +19,8 @@ Userscripts para uso em sistema interno.
 
 ---
 
+### 🆎 [Atualizador de Título](https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Atualizar%20t%C3%ADtulo%20+%20logo.user.js)
+
 ## 💡 Observações
 
 * Certifique-se de que o Tampermonkey está ativo no navegador e que os scripts de usuário estão sendo permitidos.
