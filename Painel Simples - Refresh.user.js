@@ -4,8 +4,8 @@
 // @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Painel%20Simples%20-%20Refresh.user.js
 // @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Painel%20Simples%20-%20Refresh.user.js
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @match        https://senhaguarujahomolog.saudesimples.net/paineis/*
+// @version      1.1
+// @match        https://senhaguaruja*.saudesimples.net/paineis/*
 // @grant        none
 // ==/UserScript==
 
