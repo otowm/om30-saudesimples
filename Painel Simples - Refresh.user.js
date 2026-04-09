@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Painel Simples - Refresh
 // @description  Realiza atualização da página caso senha se altere e nenhum som seja reproduzido e ao atualizar força a reprodução do áudio da seja presente na tela
-// @updateURL
-// @downloadURL
+// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Painel%20Simples%20-%20Refresh.user.js
+// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Painel%20Simples%20-%20Refresh.user.js
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @match        https://senhaguarujahomolog.saudesimples.net/paineis/*
