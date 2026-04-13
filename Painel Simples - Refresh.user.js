@@ -5,12 +5,21 @@
 // @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Painel%20Simples%20-%20Refresh.user.js
 // @namespace    http://tampermonkey.net/
 // @version      1.1
-// @match        https://senhaguaruja*.saudesimples.net/paineis/*
+// @match        https://senhaguarujahomolog.saudesimples.net/paineis/*
 // @grant        none
 // ==/UserScript==
 
 (function () {
     'use strict';
+
+    // =========================
+    // VERIFICAÇÃO DE HORÁRIO
+    // =========================
+    function dentroDoHorario() {
+        const hora = new Date().getHours();
+        // Retorna true se a hora atual for maior ou igual a 8 e menor que 17 (08:00 às 16:59)
+        return hora >= 8 && hora < 17;
+    }
 
     // =========================
     // LOG
@@ -59,6 +68,8 @@
     // REGISTRAR ÁUDIO
     // =========================
     function registrarAudio(audioEl) {
+        if (!dentroDoHorario()) return; // Bloqueia a execução fora do horário
+
         const src = audioEl.getAttribute('src');
         if (!src) return;
 
@@ -115,6 +126,8 @@
     // MONITOR DE SENHA
     // =========================
     setInterval(() => {
+        if (!dentroDoHorario()) return; // Bloqueia a execução fora do horário
+
         const senhaAtual = getSenhaAtual();
 
         log("Senha atual:", senhaAtual);
@@ -168,45 +181,50 @@
     // FORÇAR ÁUDIO APÓS RELOAD
     // =========================
     function tocarAudioAtual() {
-    const senha = getSenhaAtual();
-    const local = getLocalAtual();
+        const senha = getSenhaAtual();
+        const local = getLocalAtual();
 
-    if (!senha || !local) {
-        warn("[Init Áudio] Dados insuficientes");
-        return;
+        if (!senha || !local) {
+            warn("[Init Áudio] Dados insuficientes");
+            return;
+        }
+
+        const url = `/mp3/senha-${senha}-local-${local}.mp3`;
+
+        const audio = document.querySelector('audio[id^="notification_speech_"]');
+
+        if (!audio) {
+            warn("[Init Áudio] Audio não encontrado");
+            return;
+        }
+
+        log("[Init Áudio] Reforçando SRC:", url);
+
+        try {
+            // FORÇA MUDANÇA REAL DE SRC (gatilho principal)
+            audio.removeAttribute("src");
+
+            setTimeout(() => {
+                audio.setAttribute("src", url);
+
+                log("[Init Áudio] SRC reaplicado");
+
+            }, 200);
+
+        } catch (e) {
+            warn("[Init Áudio] Erro:", e);
+        }
     }
-
-    const url = `/mp3/senha-${senha}-local-${local}.mp3`;
-
-    const audio = document.querySelector('audio[id^="notification_speech_"]');
-
-    if (!audio) {
-        warn("[Init Áudio] Audio não encontrado");
-        return;
-    }
-
-    log("[Init Áudio] Reforçando SRC:", url);
-
-    try {
-        // FORÇA MUDANÇA REAL DE SRC (gatilho principal)
-        audio.removeAttribute("src");
-
-        setTimeout(() => {
-            audio.setAttribute("src", url);
-
-            log("[Init Áudio] SRC reaplicado");
-
-        }, 200);
-
-    } catch (e) {
-        warn("[Init Áudio] Erro:", e);
-    }
-}
 
     // =========================
     // INIT
     // =========================
     window.addEventListener('load', () => {
+        if (!dentroDoHorario()) {
+            log("Fora do horário de funcionamento (08:00 às 17:00). Nenhuma ação inicial será executada.");
+            return;
+        }
+
         setTimeout(() => {
             log("Executando áudio pós-reload...");
             tocarAudioAtual();
