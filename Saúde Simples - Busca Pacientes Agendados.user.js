@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Saúde Simples - Busca Pacientes Agendados
+// @name         Saúde - Simples Busca Pacientes Agendados
 // @namespace    http://tampermonkey.net/
 // @version      3.0
 // @description  Busca de agendas direto na tela de agendamento (prod + homolog)
