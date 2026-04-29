@@ -2,8 +2,8 @@
 // @name         Tawk.to → GLPI Sender
 // @namespace    http://tampermonkey.net/
 // @version      1.0
-// @uploadURL
-// @downloadURL
+// @uploadURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Tawk%20%E2%86%92%20GLPI.user.js
+// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Tawk%20%E2%86%92%20GLPI.user.js
 // @description  Envia chat do Tawk.to para o GLPI automaticamente
 // @author       -
 // @match        https://dashboard.tawk.to/*
