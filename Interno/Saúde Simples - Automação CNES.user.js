@@ -2,6 +2,8 @@
 // @name         Saúde Simples - Automação CNES
 // @namespace    https://guaruja.saudesimples.net/
 // @version      2.0.0
+// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
+// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
 // @description  Busca dados no CNES e CADSUS pelo CPF e preenche o formulário automaticamente
 // @author       Guarujá SMSB
 // @match        https://guarujahomolog.saudesimples.net/profissionais/new
