@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Saúde Simples - Busca Pacientes Agendados
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Busca de agendas direto na tela de agendamento (prod + homolog)
-// @downloadURL  https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.user.js
-// @updateURL    https://github.com/otowm/om30-saudesimples/blob/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.user.js
+// @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.user.js
+// @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Busca%20Pacientes%20Agendados.user.js
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/agendamentos*
 // @match        https://guarujahomolog.saudesimples.net/agendamentos*
@@ -13,6 +13,7 @@
 // @connect      guarujahomolog.saudesimples.net
 // @run-at       document-start
 // ==/UserScript==
+
 
 (function () {
     'use strict';
