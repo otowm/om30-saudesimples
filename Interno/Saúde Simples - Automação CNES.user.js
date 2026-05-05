@@ -1,9 +1,7 @@
 // ==UserScript==
-// @name         Saúde Simples - Automação CNES
+// @name         CNES + CADSUS — Busca CPF e Preenche Profissional
 // @namespace    https://guaruja.saudesimples.net/
-// @version      2.0.0
-// @updateURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
-// @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Sa%C3%BAde%20Simples%20-%20Automa%C3%A7%C3%A3o%20CNES.user.js
+// @version      2.3.1
 // @description  Busca dados no CNES e CADSUS pelo CPF e preenche o formulário automaticamente
 // @author       Guarujá SMSB
 // @match        https://guarujahomolog.saudesimples.net/profissionais/new
@@ -11,7 +9,6 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      cnes.datasus.gov.br
-// @connect      v3apiguaruja.saudesimples.net
 // @connect      wscadsus.saudesimples.net
 // ==/UserScript==
 
@@ -130,6 +127,27 @@
         }
         .cnes-vinculo-card.selected .cnes-check { display: flex; }
         .cnes-check svg { width: 10px; height: 10px; }
+
+        /* Cards de CNS (sem vínculo) */
+        .cnes-warn-box {
+            background: #fff7ed; border: 1px solid #fed7aa;
+            border-radius: 8px; padding: 10px 14px; margin-bottom: 14px;
+            font-size: 13px; color: #92400e;
+        }
+        .cns-card {
+            border: 1.5px solid #e5e7eb; border-radius: 9px;
+            padding: 11px 14px; cursor: pointer; position: relative;
+            transition: border-color .15s, background .15s;
+        }
+        .cns-card:hover   { border-color: #1a56db; background: #f0f7ff; }
+        .cns-card.selected {
+            border-color: #1a56db; background: #eff6ff;
+            box-shadow: 0 0 0 3px rgba(26,86,219,0.12);
+        }
+        .cns-card .cnes-check { right: 11px; }
+        .cns-card-nome { font-weight: 600; font-size: 13px; color: #1e3a8a; margin-bottom: 3px; padding-right: 30px; }
+        .cns-card-cns  { font-size: 12px; color: #374151; }
+
         .cadsus-section-label {
             font-size: 11px; font-weight: 700; color: #6b7280;
             text-transform: uppercase; letter-spacing: .06em;
@@ -154,14 +172,17 @@
             display: block; font-size: 11px; font-weight: 700; color: #6b7280;
             margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em;
         }
-        .cadsus-field input[type=text] {
+        .cadsus-field input[type=text],
+        .cadsus-field select {
             width: 100%; box-sizing: border-box;
             padding: 8px 11px; border: 1.5px solid #d1d5db;
             border-radius: 7px; font-size: 14px; outline: none;
             transition: border-color .2s; background: #fff; color: #111;
         }
-        .cadsus-field input[type=text]:focus { border-color: #1a56db; }
-        .cadsus-field input.empty { border-color: #fca5a5; background: #fff1f2; }
+        .cadsus-field input[type=text]:focus,
+        .cadsus-field select:focus { border-color: #1a56db; }
+        .cadsus-field input.empty,
+        .cadsus-field select.empty { border-color: #fca5a5; background: #fff1f2; }
         .cnes-modal-footer {
             padding: 12px 24px 16px; border-top: 1px solid #e5e7eb;
             display: flex; justify-content: space-between; align-items: center;
@@ -184,10 +205,15 @@
     function resetState() {
         return {
             cpf: '', step: 1,
-            profissional: null, cnesDetail: null,
+            profissional: null, profissionalList: [],
+            cnesDetail: null,
             vinculos: [], selected: null,
+            selectedCns: null,          // CNS escolhido quando não há vínculo
+            cadsusData: null,
+            cadsusAuthError: false,     // true quando CADSUS retorna 401/403
             editCep: '', editNumero: '', editNascimento: '',
             editNomeMae: '', editNomePai: '', editTelefone: '',
+            editRacaCor: '',            // valor do <option> para raca_cor
         };
     }
 
@@ -199,21 +225,57 @@
             .replace(/(\d{3})(\d{1,2})$/, '$1-$2');
     }
     function rawCPF(v) { return v.replace(/\D/g, ''); }
+
     function formatDate(iso) {
         if (!iso) return '';
         const [y, m, d] = iso.split('-');
         return `${d}/${m}/${y}`;
     }
+
+    /**
+     * Telefone: maxlength=14 no campo → formato "(XX)XXXXX-XXXX" (sem espaço).
+     */
+    function normalizeTelefone(tel) {
+        if (!tel) return '';
+        const d = tel.replace(/\D/g, '');
+        if (d.length === 11) return `(${d.slice(0,2)})${d.slice(2,7)}-${d.slice(7)}`;
+        if (d.length === 10) return `(${d.slice(0,2)})${d.slice(2,6)}-${d.slice(6)}`;
+        return tel;
+    }
+
+    /**
+     * Mapeia raca_cor.nome (CADSUS) para o value do <select> do formulário.
+     * Normaliza acentos para comparação segura.
+     */
+    function racaCorToValue(nome) {
+        if (!nome) return '';
+        const n = nome.toUpperCase()
+            .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const map = {
+            'BRANCA':         '6',
+            'PRETA':          '7',
+            'PARDA':          '8',
+            'AMARELA':        '9',
+            'INDIGENA':       '10',
+            'SEM INFORMACAO': '11',
+        };
+        return map[n] || '';
+    }
+
     function esc(s) { return (s || '').replace(/"/g, '&quot;'); }
     function emptyClass(val) { return val ? '' : 'empty'; }
+    /** Remove acentos para comparações insensíveis a diacríticos (ex: GUARUJÁ → GUARUJA) */
+    function removeAccents(s) {
+        return (s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    }
 
-    // ─── GET (CNES / DataSUS) ─────────────────────
+    // ─── REQUESTS ─────────────────────────────────
     function gmGet(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET', url,
                 headers: {
-                    'Accept': 'application/json',
+                    'Accept':  'application/json',
                     'Referer': 'https://cnes.datasus.gov.br/',
                     'Origin':  'https://cnes.datasus.gov.br',
                 },
@@ -236,7 +298,6 @@
         });
     }
 
-    // ─── POST (CADSUS) ────────────────────────────
     function gmPost(url, payload) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
@@ -244,8 +305,9 @@
                 headers: {
                     'Accept':       'application/json',
                     'Content-Type': 'application/json',
-                    'Referer': 'https://guaruja.saudesimples.net/',
-                    'Origin':  'https://guaruja.saudesimples.net',
+                    'Authorization':  'REMOVIDO',
+                    'Referer': 'https://v3guaruja.saudesimples.net/',
+                    'Origin':  'https://v3guaruja.saudesimples.net',
                 },
                 data: JSON.stringify(payload),
                 onload(r) {
@@ -254,6 +316,9 @@
                         catch (e) { reject(new Error('Resposta inválida do CADSUS')); }
                     } else if (r.status === 404) {
                         resolve(null);
+                    } else if (r.status === 401 || r.status === 403) {
+                        // Retorna sentinela de auth — loadCadsus trata amigavelmente
+                        resolve({ _cadsusAuthError: true, status: r.status });
                     } else if (r.status === 0) {
                         reject(new Error('Sem resposta (status 0) — verifique @connect no script'));
                     } else {
@@ -262,7 +327,7 @@
                 },
                 onerror()   { reject(new Error('Falha de conexão com o CADSUS')); },
                 ontimeout() { reject(new Error('Tempo limite excedido')); },
-                timeout: 1,
+                timeout: 15000,
             });
         });
     }
@@ -351,7 +416,7 @@
     // ─── ETAPA 1 — CNES ───────────────────────────
     async function handleSearchCNES() {
         const raw = rawCPF(document.getElementById('cnes-cpf-input').value);
-        if (raw.length !== 11) { setStatus('Aviso: CPF invalido. Informe os 11 digitos.', 'error'); return; }
+        if (raw.length !== 11) { setStatus('Aviso: CPF inválido. Informe os 11 dígitos.', 'error'); return; }
         state.cpf = raw;
 
         const btn = document.getElementById('cnes-search-btn');
@@ -363,21 +428,38 @@
         try {
             const list = await gmGet(`https://cnes.datasus.gov.br/services/profissionais?cpf=${raw}`);
             if (!list || !list.length) {
-                setStatus('Profissional nao encontrado no CNES para este CPF.', 'error');
+                setStatus('Profissional não encontrado no CNES para este CPF.', 'error');
                 return;
             }
+
+            state.profissionalList = list;
             state.profissional = list[0];
 
-            const detail = await gmGet(`https://cnes.datasus.gov.br/services/profissionais/${list[0].id}`);
-            if (!detail) { setStatus('Nao foi possivel obter detalhes do profissional.', 'error'); return; }
-            state.cnesDetail = detail;
+           const detail = await gmGet(`https://cnes.datasus.gov.br/services/profissionais/${list[0].id}`);
 
-            const vinculos = (detail.vinculos || []).filter(
-                v => v.noMun && v.noMun.toUpperCase().includes('GUARUJA')
-            );
-            state.vinculos = vinculos;
-            setStatus('');
-            renderVinculos(detail, vinculos);
+if (!detail) {
+    // Sem detalhes disponíveis — usa apenas os dados básicos da busca por CPF
+    // (nome + cns já retornados pelo endpoint /profissionais?cpf=...)
+    state.cnesDetail = {
+        nome:       list[0].nome || '',
+        cns:        list[0].cns  || '',
+        cmptAtual:  '—',
+        vinculos:   [],
+    };
+    state.vinculos = [];
+    setStatus('');
+    renderVinculos(state.cnesDetail, []);
+    return;
+}
+
+state.cnesDetail = detail;
+
+const vinculos = (detail.vinculos || []).filter(
+    v => v.noMun && removeAccents(v.noMun.toUpperCase()).includes('GUARUJA')
+);
+state.vinculos = vinculos;
+setStatus('');
+renderVinculos(detail, vinculos);
         } catch (err) {
             setStatus('Erro: ' + err.message, 'error');
         } finally {
@@ -390,19 +472,53 @@
         let html = `<div class="cnes-professional-info">
             <p><strong>Nome:</strong> ${detail.nome || '&mdash;'}</p>
             <p><strong>CNS:</strong> ${detail.cns || '&mdash;'}</p>
-            <p><strong>Competencia:</strong> ${detail.cmptAtual || '&mdash;'}</p>
+            <p><strong>Competência:</strong> ${detail.cmptAtual || '&mdash;'}</p>
           </div>`;
 
         if (!vinculos.length) {
-            html += `<p style="color:#6b7280;font-size:13px;margin:0">
-                Nenhum vinculo ativo em Guaruja. Prossiga para buscar dados complementares.
-            </p>`;
+            // ── Sem vínculo ativo em Guarujá ────────────────────────────────
+            html += `<div class="cnes-warn-box">
+                ⚠️ <strong>Nenhum vínculo ativo em Guarujá encontrado.</strong><br>
+                Selecione o CNS do profissional abaixo para prosseguir apenas com os dados do CADSUS.
+            </div>`;
+
+            html += `<div class="cnes-vinculos-title">Selecione o CNS do profissional:</div>
+                     <div class="cnes-vinculos-list" id="cns-cards-list">`;
+
+            state.profissionalList.forEach((p, i) => {
+                // CNS: prefere o do item da lista; fallback para detail.cns (já buscado para o item 0)
+                const cns = p.cns || (i === 0 ? detail.cns : '') || '';
+                html += `
+                  <div class="cns-card" data-cns="${esc(cns)}" data-index="${i}"
+                       tabindex="0" role="button" aria-pressed="false">
+                    <div class="cns-card-nome">${p.nome || detail.nome || '&mdash;'}</div>
+                    <div class="cns-card-cns">CNS: <strong>${cns || '&mdash;'}</strong></div>
+                    <span class="cnes-check">
+                      <svg viewBox="0 0 12 12" fill="none">
+                        <path d="M2 6L5 9L10 3" stroke="#fff" stroke-width="2"
+                          stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </span>
+                  </div>`;
+            });
+
+            html += `</div>`;
             area.innerHTML = html;
-            document.getElementById('btn-next').disabled = false;
+
+            area.querySelectorAll('.cns-card').forEach(card => {
+                card.addEventListener('click', () => selectCnsCard(card));
+                card.addEventListener('keydown', e => {
+                    if (e.key === 'Enter' || e.key === ' ') selectCnsCard(card);
+                });
+            });
+
+            // btn-next só libera após seleção de CNS
+            document.getElementById('btn-next').disabled = true;
             return;
         }
 
-        html += `<div class="cnes-vinculos-title">Selecione o vinculo desejado:</div>
+        // ── Com vínculos ────────────────────────────────────────────────────
+        html += `<div class="cnes-vinculos-title">Selecione o vínculo desejado:</div>
                  <div class="cnes-vinculos-list">`;
         vinculos.forEach((v, i) => {
             html += `
@@ -416,7 +532,7 @@
                   <span>C.H. Amb: <strong>${v.chAmb}h</strong></span>
                   <span>${v.vinculo || ''}</span>
                 </div>
-                <span class="vc-badge">${v.tpSusNaoSus === 'S' ? 'SUS' : 'Nao-SUS'}</span>
+                <span class="vc-badge">${v.tpSusNaoSus === 'S' ? 'SUS' : 'Não-SUS'}</span>
                 <span class="cnes-check">
                   <svg viewBox="0 0 12 12" fill="none">
                     <path d="M2 6L5 9L10 3" stroke="#fff" stroke-width="2"
@@ -445,7 +561,16 @@
         document.getElementById('btn-next').disabled = false;
     }
 
-    // ─── TRANSICAO ETAPA 1 -> 2 ───────────────────
+    function selectCnsCard(card) {
+        document.querySelectorAll('.cns-card').forEach(c => {
+            c.classList.remove('selected'); c.setAttribute('aria-pressed', 'false');
+        });
+        card.classList.add('selected'); card.setAttribute('aria-pressed', 'true');
+        state.selectedCns = card.dataset.cns;
+        document.getElementById('btn-next').disabled = false;
+    }
+
+    // ─── TRANSIÇÃO ETAPA 1 → 2 ───────────────────
     async function goToStep2() {
         const si1 = document.getElementById('si-1');
         si1.classList.remove('active'); si1.classList.add('done');
@@ -479,106 +604,67 @@
         document.getElementById('area-step2').innerHTML = '';
 
         document.getElementById('btn-next').style.display = 'inline-block';
-        document.getElementById('btn-next').disabled = !state.selected && state.vinculos.length > 0;
+        // Mantém estado dos botões conforme seleção anterior
+        const temVinculo = state.vinculos.length > 0;
+        document.getElementById('btn-next').disabled = temVinculo ? !state.selected : !state.selectedCns;
         document.getElementById('btn-confirm').style.display = 'none';
         document.getElementById('footer-left').innerHTML = '';
     }
 
     // ─── ETAPA 2 — CADSUS ─────────────────────────
-    // Estratégia: tenta v3apiguaruja (GET, usa cookies da sessão) como primário.
-    // Se falhar ou não retornar dados, tenta wscadsus (POST) como fallback.
     async function loadCadsus() {
-    const area = document.getElementById('area-step2');
+        const area = document.getElementById('area-step2');
+        area.innerHTML = `<div style="text-align:center;padding:24px 0;color:#1a56db;font-size:14px">
+            Consultando CADSUS...
+        </div>`;
+        document.getElementById('btn-confirm').disabled = true;
 
-    // Aviso simples
-    area.innerHTML = `
-        <div class="cadsus-warn-box" style="text-align:center; font-size:14px;">
-            <strong>Consulta ao CADSUS temporariamente desativada.</strong><br>
-            Prosseguir apenas com os dados do CNES.
-        </div>
-    `;
+        let found = null;
+        let cadsusAuthError = false;
+        try {
+            const cpfFormatado = formatCPF(state.cpf); // "000.000.000-00"
+            const result = await gmPost(
+                'https://wscadsus.saudesimples.net/v1/pdq/consultar',
+                { cpf_numero: cpfFormatado }
+            );
 
-    // Limpa qualquer dado antigo
-    state.editCep        = '';
-    state.editNumero     = '';
-    state.editNascimento = '';
-    state.editNomeMae    = '';
-    state.editNomePai    = '';
-    state.editTelefone   = '';
+            if (result && result._cadsusAuthError) {
+                // 401/403 — endpoint requer autenticação que não temos aqui
+                console.warn(`[CADSUS] Autenticação necessária (HTTP ${result.status}). Formulário será exibido para preenchimento manual.`);
+                cadsusAuthError = true;
+            } else if (result && result.length > 0) {
+                const raw = result[0];
+                // CNS do CADSUS nunca é utilizado — apenas dados cadastrais
+                found = {
+                    nome:               raw.nome                || '',
+                    data_nascimento:    raw.data_nascimento      || '',
+                    nome_mae:           raw.nome_mae             || '',
+                    nome_pai:           raw.nome_pai             || '',
+                    raca_cor:           raw.raca_cor             || null,
+                    sexo:               raw.sexo                 || null,
+                    telefone_celular:   raw.telefone_celular     || '',
+                    residencia_cep:     raw.residencia_cep       || '',
+                    residencia_numero:  raw.residencia_numero    || '',
+                    residencia_municipio: raw.residencia_municipio || null,
+                };
 
-    // Libera botão de confirmar
-    document.getElementById('btn-confirm').disabled = false;
-}
-
-    /**
-     * GET para v3apiguaruja — envia cookies da sessão do site (anonymous: false).
-     * O Tampermonkey injeta os cookies do domínio automaticamente com cookie:true.
-     */
-    function gmGetV3(url) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'GET', url,
-                headers: {
-                    'Accept':  'application/json',
-                    'Referer': 'https://guaruja.saudesimples.net/',
-                    'Origin':  'https://guaruja.saudesimples.net',
-                },
-                cookie: true,
-                onload(r) {
-                    if (r.status === 200 || r.status === 304) {
-                        try { resolve(JSON.parse(r.responseText)); }
-                        catch (e) { reject(new Error('Resposta inválida do v3api')); }
-                    } else if (r.status === 404) {
-                        resolve(null);
-                    } else if (r.status === 401 || r.status === 403) {
-                        reject(new Error('Sessao expirada ou sem permissao (' + r.status + ')'));
-                    } else if (r.status === 0) {
-                        reject(new Error('Sem resposta (status 0)'));
-                    } else {
-                        reject(new Error('HTTP ' + r.status));
-                    }
-                },
-                onerror()   { reject(new Error('Falha de conexao com v3apiguaruja')); },
-                ontimeout() { reject(new Error('Tempo limite excedido')); },
-                timeout: 1,
-            });
-        });
-    }
-
-    /**
-     * Normaliza o objeto do v3apiguaruja para o mesmo formato do wscadsus,
-     * garantindo que os campos esperados existam com os nomes corretos.
-     * O v3 não retorna nome_pai, então deixamos vazio.
-     */
-    function normalizeV3(v3) {
-        return {
-            nome:               v3.nome                || '',
-            residencia_cep:     v3.residencia_cep      || '',
-            residencia_numero:  v3.residencia_numero    || '',
-            data_nascimento:    v3.data_nascimento      || '',
-            nome_mae:           v3.nome_mae             || '',
-            nome_pai:           '',   // v3 não retorna nome_pai
-            telefone_celular:   v3.telefone_celular     || '',
-            sexo:               v3.sexo || null,
-            residencia_municipio: v3.residencia_municipio || null,
-            raca_cor:           null,
-        };
-    }
-
-    /**
-     * Garante formato "(XX) XXXXX-XXXX".
-     * O v3 retorna "(13)99742-3127" (sem espaço), o wscadsus retorna "(13) 99742-3127".
-     */
-    function normalizeTelefone(tel) {
-        if (!tel) return '';
-        const digits = tel.replace(/\D/g, '');
-        if (digits.length === 11) {
-            return '(' + digits.slice(0,2) + ') ' + digits.slice(2,7) + '-' + digits.slice(7);
+                // Pré-preenche os campos editáveis do estado
+                state.editCep        = raw.residencia_cep       || '';
+                state.editNumero     = raw.residencia_numero     || '';
+                state.editNascimento = formatDate(raw.data_nascimento);
+                state.editNomeMae    = raw.nome_mae              || '';
+                state.editNomePai    = raw.nome_pai              || '';
+                state.editTelefone   = normalizeTelefone(raw.telefone_celular);
+                state.editRacaCor    = racaCorToValue(raw.raca_cor ? raw.raca_cor.nome : '');
+            }
+        } catch (err) {
+            console.warn('[CADSUS] Erro na consulta:', err.message);
+            // Continua sem dados do CADSUS — renderiza formulário vazio
         }
-        if (digits.length === 10) {
-            return '(' + digits.slice(0,2) + ') ' + digits.slice(2,6) + '-' + digits.slice(6);
-        }
-        return tel; // retorna original se não reconhecido
+
+        state.cadsusData = found;
+        state.cadsusAuthError = cadsusAuthError;
+        renderStep2(found);
     }
 
     function renderStep2(found) {
@@ -589,20 +675,32 @@
 
         let html = '';
 
-        // Resumo CNES
+        // ── Resumo CNES ──────────────────────────────────────────────────────
+        const nomeProfissional = detail ? detail.nome : (p ? p.nome : '&mdash;');
+        // CNS: usa o do CNES (vínculo ou selecionado), NUNCA o do CADSUS
+        const cnsProfissional  = state.selectedCns || (detail ? detail.cns : (p ? p.cns : '&mdash;'));
+
         html += `<div class="cnes-professional-info" style="margin-bottom:14px">
-            <p><strong>Profissional:</strong> ${detail ? detail.nome : (p ? p.nome : '&mdash;')}</p>
-            <p><strong>CNS:</strong> ${detail ? detail.cns : (p ? p.cns : '&mdash;')}</p>`;
+            <p><strong>Profissional:</strong> ${nomeProfissional}</p>
+            <p><strong>CNS:</strong> ${cnsProfissional}</p>`;
+
         if (v) {
             html += `<p><strong>Unidade:</strong> ${v.noFant} <span style="color:#6b7280">(CNES ${v.cnes})</span></p>
-                     <p><strong>Funcao:</strong> ${v.dsCbo} <span style="color:#6b7280">(CBO ${v.cbo})</span></p>`;
+                     <p><strong>Função:</strong> ${v.dsCbo} <span style="color:#6b7280">(CBO ${v.cbo})</span></p>`;
+        } else if (state.selectedCns) {
+            html += `<p style="color:#92400e"><strong>⚠️ Sem vínculo ativo em Guarujá.</strong> Apenas dados complementares serão preenchidos.</p>`;
         }
         html += `</div>`;
 
-        // Status CADSUS
-        if (!found) {
+        // ── Status CADSUS ────────────────────────────────────────────────────
+        if (state.cadsusAuthError) {
             html += `<div class="cadsus-warn-box">
-                CPF nao encontrado no CADSUS. Preencha os dados manualmente.
+                ⚠️ <strong>CADSUS não autorizou a consulta (HTTP 401).</strong><br>
+                O endpoint requer autenticação de sessão. Preencha os dados complementares manualmente.
+            </div>`;
+        } else if (!found) {
+            html += `<div class="cadsus-warn-box">
+                CPF não encontrado no CADSUS. Preencha os dados complementares manualmente.
             </div>`;
         } else {
             html += `<div class="cadsus-info-box">
@@ -611,15 +709,15 @@
                   <strong>Nasc.:</strong> ${formatDate(found.data_nascimento)}
                   &nbsp;|&nbsp;
                   <strong>Sexo:</strong> ${found.sexo ? found.sexo.nome : '&mdash;'}
-                  ${found.raca_cor ? '&nbsp;|&nbsp;<strong>Raca/Cor:</strong> ' + found.raca_cor.nome : ''}
+                  ${found.raca_cor ? `&nbsp;|&nbsp;<strong>Raça/Cor:</strong> ${found.raca_cor.nome}` : ''}
                 </p>
                 ${found.residencia_municipio
-                    ? '<p><strong>Municipio:</strong> ' + found.residencia_municipio.nome + ' / ' + found.residencia_municipio.uf + '</p>'
+                    ? `<p><strong>Município:</strong> ${found.residencia_municipio.nome} / ${found.residencia_municipio.uf}</p>`
                     : ''}
             </div>`;
         }
 
-        // Formulario editavel
+        // ── Formulário editável ──────────────────────────────────────────────
         html += `<p class="cadsus-section-label">Confirme ou edite os dados complementares:</p>
           <div class="cadsus-form-grid">
             <div class="cadsus-field">
@@ -629,7 +727,7 @@
                 placeholder="00000-000" maxlength="9"/>
             </div>
             <div class="cadsus-field">
-              <label>Numero de residencia</label>
+              <label>Número de residência</label>
               <input type="text" id="ed-numero" value="${esc(state.editNumero)}"
                 class="${emptyClass(state.editNumero)}"
                 placeholder="Ex: 152"/>
@@ -644,15 +742,29 @@
               <label>Telefone celular</label>
               <input type="text" id="ed-tel" value="${esc(state.editTelefone)}"
                 class="${emptyClass(state.editTelefone)}"
-                placeholder="(00) 00000-0000" maxlength="15"/>
+                placeholder="(00)00000-0000" maxlength="14"/>
+            </div>
+          </div>
+          <div class="cadsus-form-grid">
+            <div class="cadsus-field">
+              <label>Raça / Cor</label>
+              <select id="ed-raca" class="${emptyClass(state.editRacaCor)}">
+                <option value="">-- Selecione --</option>
+                <option value="6"  ${state.editRacaCor === '6'  ? 'selected' : ''}>BRANCA</option>
+                <option value="7"  ${state.editRacaCor === '7'  ? 'selected' : ''}>PRETA</option>
+                <option value="8"  ${state.editRacaCor === '8'  ? 'selected' : ''}>PARDA</option>
+                <option value="9"  ${state.editRacaCor === '9'  ? 'selected' : ''}>AMARELA</option>
+                <option value="10" ${state.editRacaCor === '10' ? 'selected' : ''}>INDÍGENA</option>
+                <option value="11" ${state.editRacaCor === '11' ? 'selected' : ''}>SEM INFORMAÇÃO</option>
+              </select>
             </div>
           </div>
           <div class="cadsus-form-grid full">
             <div class="cadsus-field">
-              <label>Nome da mae</label>
+              <label>Nome da mãe</label>
               <input type="text" id="ed-mae" value="${esc(state.editNomeMae)}"
                 class="${emptyClass(state.editNomeMae)}"
-                placeholder="Nome completo da mae"/>
+                placeholder="Nome completo da mãe"/>
             </div>
           </div>
           <div class="cadsus-form-grid full">
@@ -665,7 +777,7 @@
 
         area.innerHTML = html;
 
-        // Bind edicao em tempo real
+        // Bind edição em tempo real
         function bindEdit(id, fn) {
             const el = document.getElementById(id);
             if (el) el.addEventListener('input', e => fn(e.target.value));
@@ -676,32 +788,35 @@
         bindEdit('ed-tel',    val => state.editTelefone    = val);
         bindEdit('ed-mae',    val => state.editNomeMae     = val);
         bindEdit('ed-pai',    val => state.editNomePai     = val);
+        bindEdit('ed-raca',   val => state.editRacaCor     = val);
 
         document.getElementById('btn-confirm').disabled = false;
     }
 
-    // ─── CONFIRMACAO FINAL ────────────────────────
+    // ─── CONFIRMAÇÃO FINAL ────────────────────────
     function handleConfirm() {
         const detail = state.cnesDetail;
         const p      = state.profissional;
         const v      = state.selected;
         const nome   = detail ? detail.nome : (p ? p.nome : '');
-        const cns    = detail ? detail.cns  : (p ? p.cns  : '');
+        // CNS: usa selectedCns (sem vínculo) ou cns do detail (com vínculo)
+        const cns    = state.selectedCns || (detail ? detail.cns : (p ? p.cns : ''));
 
-        // Campos simples — CNES
+        // ── Campos CNES ──────────────────────────────────────────────────────
         fillSimple('#profissional_nome',        nome);
         fillSimple('#profissional_codigo_cns',  cns);
         fillSimple('#profissional_cpf_numero',  formatCPF(state.cpf));
 
-        // Campos simples — CADSUS
+        // ── Campos CADSUS ────────────────────────────────────────────────────
         fillSimple('#profissional_residencia_cep',    state.editCep);
         fillSimple('#profissional_residencia_numero', state.editNumero);
         fillSimple('#profissional_data_nascimento',   state.editNascimento);
         fillSimple('#profissional_nome_mae',          state.editNomeMae);
         fillSimple('#profissional_nome_pai',          state.editNomePai);
         fillSimple('#profissional_telefone_celular',  state.editTelefone);
+        fillSelect('#profissional_raca_cor_id',       state.editRacaCor);
 
-        // Token inputs — CBO e Unidade
+        // ── Token inputs — CBO e Unidade (apenas se houver vínculo) ──────────
         if (v) {
             fillTokenInput('#token-input-profissional_ocupacao_token', v.cbo,  v.dsCbo);
             fillTokenInput('#token-input-profissional_unidade_token',  v.cnes, v.noFant);
@@ -710,30 +825,40 @@
         closeModal();
         showToast('Dados de ' + (nome.split(' ')[0] || 'profissional') + ' preenchidos!');
 
-        // Clica no botao de avanco (aguarda token inputs processarem)
-        setTimeout(() => {
-            const advBtn = document.querySelector('#ocupacao > div.grid_2 > a');
-            if (advBtn) {
-                advBtn.click();
-            } else {
-                console.warn('[CNES] Botao #ocupacao > div.grid_2 > a nao encontrado.');
-            }
-        }, 1800);
+        // Clica no botão de avanço (aguarda token inputs processarem)
+        if (v) {
+            setTimeout(() => {
+                const advBtn = document.querySelector('#ocupacao > div.grid_2 > a');
+                if (advBtn) {
+                    advBtn.click();
+                } else {
+                    console.warn('[CNES] Botão #ocupacao > div.grid_2 > a não encontrado.');
+                }
+            }, 1800);
+        }
     }
 
     // ─── FILL HELPERS ─────────────────────────────
     function fillSimple(selector, value) {
         const el = document.querySelector(selector);
-        if (!el) { console.warn('[CNES] Campo nao encontrado: ' + selector); return; }
+        if (!el) { console.warn('[CNES] Campo não encontrado: ' + selector); return; }
         Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
             .set.call(el, value || '');
         el.dispatchEvent(new Event('input',  { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
+    function fillSelect(selector, value) {
+        if (!value) return;
+        const el = document.querySelector(selector);
+        if (!el) { console.warn('[CNES] Select não encontrado: ' + selector); return; }
+        el.value = value;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
     function fillTokenInput(inputSelector, searchValue, displayHint) {
         const input = document.querySelector(inputSelector);
-        if (!input) { console.warn('[CNES] Token input nao encontrado: ' + inputSelector); return; }
+        if (!input) { console.warn('[CNES] Token input não encontrado: ' + inputSelector); return; }
 
         // Remove tokens existentes
         const list = input.closest('ul.token-input-list, ul[class*="token-input-list"]');
@@ -792,7 +917,7 @@
         setTimeout(() => t.remove(), 3300);
     }
 
-    // ─── BOTAO FLUTUANTE + INIT ───────────────────
+    // ─── BOTÃO FLUTUANTE + INIT ───────────────────
     function addTriggerButton() {
         const btn = document.createElement('button');
         btn.id = 'cnes-trigger-btn';
@@ -809,8 +934,6 @@
 
     function init() {
         addTriggerButton();
-        // Abre automaticamente ao carregar a pagina.
-        // Comente as 3 linhas abaixo para abrir apenas pelo botao flutuante.
         setTimeout(() => {
             if (!document.getElementById('cnes-overlay')) buildModal();
         }, 800);
