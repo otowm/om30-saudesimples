@@ -305,7 +305,7 @@
                 headers: {
                     'Accept':       'application/json',
                     'Content-Type': 'application/json',
-                    'Authorization':  'REMOVIDO',
+                    'Authorization':  '<INSIRA BEARER AQUI>',
                     'Referer': 'https://v3guaruja.saudesimples.net/',
                     'Origin':  'https://v3guaruja.saudesimples.net',
                 },
