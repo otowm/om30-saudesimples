@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tawk.to → GLPI Sender
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @uploadURL    https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Tawk%20%E2%86%92%20GLPI.user.js
 // @downloadURL  https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Interno/Tawk%20%E2%86%92%20GLPI.user.js
 // @description  Envia chat do Tawk.to para o GLPI automaticamente
@@ -35,6 +35,7 @@
         'Pedro Justino Sampaio Andrade': { items_id: '203', email: 'pedro.andrade@om30.com.br' },
         'Tauana Matos':                  { items_id: '672', email: 'tauana.matos@om30.com.br' },
         'Jorge Cruz':                    { items_id: '64',  email: 'jorge.cruz@om30.com.br' },
+        'Ana Rodrigues':                 { items_id: '53',  email: 'ana.rodrigues@om30.com.br' },
     };
 
     // ── Categorias de unidade (definidas no Tawk) ───────────────────────
