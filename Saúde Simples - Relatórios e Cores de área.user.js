@@ -38,14 +38,6 @@
         } else {
             // Fallback para os hardcoded
             return [
-                { area: "Área Azul", nome: "NIER OLIVEROS BEREAU" },
-                { area: "Área Azul", nome: "PRISCILA TOLEDO DE AZEVEDO SILVA" },
-                { area: "Área Rosa", nome: "TIARA RUANI DA CRUZ" },
-                { area: "Área Rosa", nome: "LARISSA RAIANE ALMEIDA DOS SANTOS" },
-                { area: "Área Laranja", nome: "ANNABEL CABALLERO MACHADO" },
-                { area: "Área Laranja", nome: "LARISSA KRISTAL CASANOVA MONTEIRO" },
-                { area: "Área Verde", nome: "LOUISE MARCELA XAVIER DE ARAUJO" },
-                { area: "Área Verde", nome: "CAMILA ANGELO BEZERRA" },
             ];
         }
     }
