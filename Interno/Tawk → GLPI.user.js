@@ -36,6 +36,7 @@
         'Tauana Matos':                  { items_id: '672', email: 'tauana.matos@om30.com.br' },
         'Jorge Cruz':                    { items_id: '64',  email: 'jorge.cruz@om30.com.br' },
         'Ana Rodrigues':                 { items_id: '53',  email: 'ana.rodrigues@om30.com.br' },
+        'Stella Funagoshi':              { items_id: '315', email: 'stella.funagoshi@om30.com.br},
     };
 
     // ── Categorias de unidade (definidas no Tawk) ───────────────────────
