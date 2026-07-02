@@ -1,0 +1,2919 @@
+// ==UserScript==
+// @name         Saúde Simples - Pré-visualização de Agenda
+// @namespace    https://guarujahomolog.saudesimples.net/
+// @version      1.4.3
+// @description  Pré-visualização lateral em tempo real para criação e edição de agendas, corrigindo botão em agenda específica salva.
+// @author       otowm
+// @match        https://guarujahomolog.saudesimples.net/agendas/new*
+// @match        https://guarujahomolog.saudesimples.net/agendas/*/edit*
+// @match        https://guaruja.saudesimples.net/agendas/new*
+// @match        https://guaruja.saudesimples.net/agendas/*/edit*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  const INTERVALO_POR_HORA_MINUTOS = 60;
+  const ARREDONDAMENTO_DISTRIBUIDO = 'floor';
+  // Opções: 'floor', 'round', 'ceil'
+
+  /**
+   * Modo SEM horário distribuído:
+   * quando sobra vaga, ela fica nos primeiros horários.
+   *
+   * Ex.: 5 vagas em 2 horários:
+   * 08:00 - 3 vagas
+   * 09:00 - 2 vagas
+   */
+  const DISTRIBUIR_SOBRA_NOS_PRIMEIROS_HORARIOS = true;
+
+  const DEBUG = false;
+
+  const TIPOS_VAGA = {
+    nova_consulta: {
+      label: 'Primeira Vez',
+      field: 'nova_consulta',
+    },
+    retorno: {
+      label: 'Retorno',
+      field: 'retorno',
+    },
+    reserva_tecnica: {
+      label: 'Reserva Técnica',
+      field: 'reserva_tecnica',
+    },
+  };
+
+  /**
+   * No horário distribuído, o Saúde Simples distribui considerando a soma
+   * das vagas de todos os tipos, e não cada tipo isoladamente.
+   *
+   * Ordem observada/assumida:
+   * 1) Primeira Vez
+   * 2) Retorno
+   * 3) Reserva Técnica
+   *
+   * Ex.: 08:00 às 12:00 com 12 Retornos e 4 Reserva:
+   * total = 16 vagas, intervalo = 240 / 16 = 15 minutos
+   * Retorno ocupa 08:00 até 10:45
+   * Reserva ocupa 11:00 até 11:45
+   */
+  const ORDEM_TIPOS_DISTRIBUIDO = [
+    'nova_consulta',
+    'retorno',
+    'reserva_tecnica',
+  ];
+
+  /**
+   * Formulário de criação/novo período dentro da edição:
+   * agenda[agendas_mapas_periodos_attributes][...]
+   */
+  const MAPA_PERIODO_RE = /agenda\[agendas_mapas_periodos_attributes\]\[([^\]]+)\]/;
+
+  /**
+   * Período já salvo na tela de edição:
+   * agenda[agendas_mapas_periodos_validos_attributes][0]
+   */
+  const MAPA_PERIODO_VALIDO_RE = /agenda\[agendas_mapas_periodos_validos_attributes\]\[([^\]]+)\]/;
+
+  const MAPA_DIA_RE = /\[agendas_mapas_dias_attributes\]\[([^\]]+)\]/;
+  const MAPA_HORARIO_RE = /\[agendas_mapas_horarios_attributes\]\[([^\]]+)\]/;
+
+  /**
+   * Agenda específica:
+   * agenda[agendas_especificas_dias_attributes][...]
+   */
+  const ESPECIFICA_DIA_RE = /agenda\[agendas_especificas_dias_attributes\]\[([^\]]+)\]/;
+  const ESPECIFICA_HORARIO_RE = /\[agendas_especificas_horarios_attributes\]\[([^\]]+)\]/;
+
+  let ultimoTipoSelecionado = 'retorno';
+  let contextoAtual = null;
+  let popupAberto = false;
+  let calculadoraIntervaloMinutos = 15;
+  let calculadoraAberta = false;
+  let livePollTimer = null;
+  let lastPreviewSignature = '';
+
+  const rerenderLive = debounce(() => {
+    if (!contextoAtual) return;
+
+    const data = collectPreviewData(contextoAtual);
+    if (!data) return;
+
+    renderSidePanel(data, ultimoTipoSelecionado);
+  }, 140);
+
+  injectStyles();
+  attachPreviewButtons();
+
+  const observer = new MutationObserver(debounce((mutations) => {
+    /**
+     * O painel lateral também altera o DOM. Se o observer reagir às mutações
+     * da própria prévia, o select "Primeira Vez / Retorno / Reserva Técnica"
+     * abre e fecha sozinho.
+     */
+    const onlyPreviewMutations = mutations.every((mutation) => {
+      return isPreviewUiElement(mutation.target);
+    });
+
+    if (onlyPreviewMutations) return;
+
+    attachPreviewButtons();
+
+    if (contextoAtual) {
+      rerenderLive();
+    }
+  }, 180));
+
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+  });
+
+  document.addEventListener('input', (ev) => {
+    if (isPreviewUiElement(ev.target)) return;
+    if (contextoAtual) rerenderLive();
+  }, true);
+
+  document.addEventListener('change', (ev) => {
+    if (isPreviewUiElement(ev.target)) return;
+    if (contextoAtual) rerenderLive();
+  }, true);
+
+  /**
+   * Alguns campos com máscara/autocomplete podem atualizar valor sem disparar
+   * input/change de forma confiável. keyup e blur ajudam a pegar alteração de horários.
+   */
+  document.addEventListener('keyup', (ev) => {
+    if (isPreviewUiElement(ev.target)) return;
+    if (contextoAtual && isAgendaField(ev.target)) rerenderLive();
+  }, true);
+
+  document.addEventListener('blur', (ev) => {
+    if (isPreviewUiElement(ev.target)) return;
+    if (contextoAtual && isAgendaField(ev.target)) rerenderLive();
+  }, true);
+
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closePopup();
+  });
+
+  function attachPreviewButtons() {
+    const mapaCheckboxConfigs = findMapaPeriodoDistribuidoCheckboxes().map((checkbox) => ({
+      kind: 'mapa_periodo',
+      key: extractMapaPeriodoKey(checkbox.name),
+      anchor: checkbox,
+      holder: findBooleanHolder(checkbox),
+      title: 'Abrir pré-visualização lateral deste período de vigência',
+      insertAfterAnchor: false,
+    })).filter((item) => item.key);
+
+    /**
+     * Agenda específica pode existir em dois formatos:
+     *
+     * 1) criação/novo item: checkbox editável "possui_horario_distribuido";
+     * 2) agenda específica já salva: separação fixa em texto "Por hora" / "Distribuído".
+     *
+     * Quando os dois aparecem no DOM, devemos preferir a separação fixa visível.
+     * Caso contrário, o botão é criado no <li> interno/accessor e parece "sumir".
+     */
+    const especificaSalvaConfigs = findAgendaEspecificaKeys().map((key) => {
+      const separationElement = findAgendaEspecificaSeparationElement(key);
+      const dataElement = findAgendaEspecificaDataElement(key);
+
+      return {
+        kind: 'agenda_especifica',
+        key,
+        anchor: separationElement || dataElement,
+        holder: separationElement || findFieldHolder(dataElement),
+        title: 'Abrir pré-visualização lateral desta agenda específica salva',
+        insertAfterAnchor: Boolean(separationElement),
+      };
+    }).filter((item) => item.key && item.anchor && item.holder);
+
+    const especificaKeysComSeparacaoFixa = new Set(
+      especificaSalvaConfigs
+        .filter((item) => item.insertAfterAnchor)
+        .map((item) => item.key)
+    );
+
+    const especificaCheckboxConfigs = findEspecificaDistribuidoCheckboxes().map((checkbox) => ({
+      kind: 'agenda_especifica',
+      key: extractEspecificaDiaKey(checkbox.name),
+      anchor: checkbox,
+      holder: findBooleanHolder(checkbox),
+      title: 'Abrir pré-visualização lateral desta agenda específica',
+      insertAfterAnchor: false,
+    })).filter((item) => {
+      /**
+       * Se já temos o texto fixo "Por hora" / "Distribuído" para essa agenda,
+       * não criamos botão no checkbox/accessor interno.
+       */
+      return item.key && !especificaKeysComSeparacaoFixa.has(item.key);
+    });
+
+    const checkboxConfigs = [
+      ...mapaCheckboxConfigs,
+      ...especificaCheckboxConfigs,
+    ];
+
+    const periodoValidoConfigs = findMapaPeriodoValidoKeys().map((key) => {
+      const separationElement = findMapaPeriodoValidoSeparationElement(key);
+      const dataInicial = findMapaPeriodoValidoDataInicialElement(key);
+
+      return {
+        kind: 'mapa_periodo_valido',
+        key,
+        anchor: separationElement || dataInicial,
+        holder: separationElement || findFieldHolder(dataInicial),
+        title: 'Abrir pré-visualização lateral deste período já salvo',
+        insertAfterAnchor: Boolean(separationElement),
+      };
+    }).filter((item) => item.key && item.anchor && item.holder);
+
+    const configs = [
+      /**
+       * Separação fixa primeiro.
+       * Assim, se existir agenda específica salva, o botão fica no local visível.
+       */
+      ...especificaSalvaConfigs,
+      ...checkboxConfigs,
+      ...periodoValidoConfigs,
+    ];
+
+    if (DEBUG) {
+      console.log('[Preview Agenda] Contextos encontrados:', configs);
+    }
+
+    configs.forEach(({ kind, key, anchor, holder, title, insertAfterAnchor }) => {
+      const previewId = makeContextId({ kind, key });
+
+      if (!holder) return;
+
+      holder.classList.add('ss-preview-horario-distribuido-host');
+
+      /**
+       * Não use apenas holder.querySelector aqui.
+       * Em períodos/agendas já salvos, o botão pode ser inserido como irmão
+       * do texto fixo "Por hora" / "Distribuído".
+       *
+       * Se o botão já existir, mas estiver no <li> interno/accessor, reaproveitamos
+       * o mesmo botão e movemos para o local correto.
+       */
+      const existingButton = getPreviewButton(previewId);
+
+      let button = existingButton;
+
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ss-agenda-preview-btn';
+        button.dataset.ssAgendaPreviewButton = previewId;
+        button.textContent = 'Pré-visualizar';
+        button.title = title;
+        button.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          openSidePreview({ kind, key });
+        });
+      } else {
+        button.title = title;
+      }
+
+      if (insertAfterAnchor) {
+        /**
+         * Em telas de edição, a separação pode virar texto fixo:
+         * "Por hora" ou "Distribuído".
+         * O botão deve ficar ao lado desse texto.
+         */
+        anchor.classList.add('ss-preview-separacao-fixa');
+        anchor.insertAdjacentElement('afterend', button);
+        return;
+      }
+
+      const labelEl = findLabelForInput(anchor, holder);
+
+      if (labelEl && labelEl.parentElement) {
+        labelEl.classList.add('ss-preview-horario-distribuido-label');
+        labelEl.insertAdjacentElement('afterend', button);
+      } else {
+        holder.appendChild(button);
+      }
+    });
+
+    updateActiveButtonState();
+  }
+
+  function findMapaPeriodoDistribuidoCheckboxes() {
+    return getAllNamedFields().filter((el) => {
+      return el.matches('input[type="checkbox"]')
+        && el.name.includes('agenda[agendas_mapas_periodos_attributes]')
+        && el.name.endsWith('[possui_horario_distribuido]');
+    });
+  }
+
+  function findEspecificaDistribuidoCheckboxes() {
+    return getAllNamedFields().filter((el) => {
+      return el.matches('input[type="checkbox"]')
+        && el.name.includes('agenda[agendas_especificas_dias_attributes]')
+        && el.name.endsWith('[possui_horario_distribuido]');
+    });
+  }
+
+  function findAgendaEspecificaKeys() {
+    const keys = new Set();
+
+    getAllNamedFields().forEach((el) => {
+      if (!el.name || !el.name.includes('agenda[agendas_especificas_dias_attributes]')) return;
+
+      const key = extractEspecificaDiaKey(el.name);
+      if (key !== null) keys.add(key);
+    });
+
+    return [...keys].sort((a, b) => Number(a) - Number(b));
+  }
+
+  function findMapaPeriodoValidoKeys() {
+    const keys = new Set();
+
+    getAllNamedFields().forEach((el) => {
+      if (!el.name || !el.name.includes('agenda[agendas_mapas_periodos_validos_attributes]')) return;
+
+      const key = extractMapaPeriodoValidoKey(el.name);
+      if (key !== null) keys.add(key);
+    });
+
+    return [...keys].sort((a, b) => Number(a) - Number(b));
+  }
+
+  function getPreviewButton(previewId) {
+    return Array.from(document.querySelectorAll('.ss-agenda-preview-btn')).find((button) => {
+      return button.dataset.ssAgendaPreviewButton === previewId;
+    }) || null;
+  }
+
+  function hasPreviewButton(previewId) {
+    return Boolean(getPreviewButton(previewId));
+  }
+
+  function openSidePreview(context) {
+    contextoAtual = context;
+    closePopup();
+
+    const data = collectPreviewData(context);
+    if (!data) return;
+
+    renderSidePanel(data, ultimoTipoSelecionado);
+    document.body.classList.add('ss-agenda-preview-side-open');
+    updateActiveButtonState();
+    startLivePolling();
+  }
+
+  function renderSidePanel(data, tipoSelecionado) {
+    let panel = document.getElementById('ss-agenda-preview-side-panel');
+    const previousState = captureSidePanelState(panel);
+
+    if (!panel) {
+      panel = document.createElement('aside');
+      panel.id = 'ss-agenda-preview-side-panel';
+      document.body.appendChild(panel);
+    }
+
+    lastPreviewSignature = getPreviewSignature(data);
+    panel.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'ss-side-header';
+
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'ss-side-title-wrap';
+
+    const title = document.createElement('h2');
+    title.textContent = getPreviewTitle(data);
+
+    const subtitle = document.createElement('div');
+    subtitle.className = 'ss-preview-subtitle';
+    subtitle.textContent = buildSubtitle(data);
+
+    titleWrap.append(title, subtitle);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ss-side-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Fechar prévia lateral';
+    closeBtn.addEventListener('click', closeSidePanel);
+
+    header.append(titleWrap, closeBtn);
+
+    const controls = document.createElement('div');
+    controls.className = 'ss-side-controls';
+
+    const tipoSelector = renderTipoVagaSelector(data, tipoSelecionado);
+
+    const actions = document.createElement('div');
+    actions.className = 'ss-side-actions';
+
+    const calculatorToggle = document.createElement('button');
+    calculatorToggle.type = 'button';
+    calculatorToggle.className = calculadoraAberta
+      ? 'ss-side-action-btn ss-side-action-btn-active'
+      : 'ss-side-action-btn';
+    calculatorToggle.textContent = calculadoraAberta ? 'Ocultar calculadora' : 'Mostrar calculadora';
+    calculatorToggle.addEventListener('click', () => {
+      calculadoraAberta = !calculadoraAberta;
+
+      if (!contextoAtual) return;
+
+      const updatedData = collectPreviewData(contextoAtual);
+      if (!updatedData) return;
+
+      renderSidePanel(updatedData, ultimoTipoSelecionado);
+    });
+
+    actions.append(calculatorToggle);
+    controls.append(tipoSelector, actions);
+
+    const status = document.createElement('div');
+    status.className = 'ss-live-status';
+    status.textContent = 'Atualiza automaticamente conforme você edita os campos.';
+
+    const body = document.createElement('div');
+    body.className = 'ss-side-body';
+
+    const rows = buildPreviewRows(data, tipoSelecionado);
+    const validationWarnings = buildValidationWarnings(data);
+
+    body.appendChild(renderSummary(data, rows, tipoSelecionado, validationWarnings.length));
+
+    if (validationWarnings.length) {
+      body.appendChild(renderValidationWarnings(validationWarnings));
+    }
+
+    body.appendChild(renderRows(rows, data, tipoSelecionado));
+
+    if (calculadoraAberta) {
+      const calculator = renderVagasCalculator(data);
+      panel.append(header, controls, status, calculator, body);
+    } else {
+      panel.append(header, controls, status, body);
+    }
+
+    restoreSidePanelState(panel, previousState);
+  }
+
+  function closeSidePanel() {
+    contextoAtual = null;
+    document.body.classList.remove('ss-agenda-preview-side-open');
+
+    const panel = document.getElementById('ss-agenda-preview-side-panel');
+    if (panel) panel.remove();
+
+    stopLivePolling();
+    closePopup();
+    updateActiveButtonState();
+  }
+
+  function updateActiveButtonState() {
+    const activeId = contextoAtual ? makeContextId(contextoAtual) : '';
+
+    document.querySelectorAll('.ss-agenda-preview-btn').forEach((button) => {
+      const isActive = activeId && button.dataset.ssAgendaPreviewButton === activeId;
+      button.classList.toggle('ss-agenda-preview-btn-active', Boolean(isActive));
+      button.textContent = isActive ? 'Prévia aberta' : 'Pré-visualizar';
+    });
+  }
+
+  function renderPopup(data, tipoSelecionado) {
+    const previousState = capturePopupState();
+
+    closePopup(false);
+    popupAberto = true;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'ss-agenda-preview-overlay';
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay) closePopup();
+    });
+
+    const modal = document.createElement('div');
+    modal.id = 'ss-agenda-preview-modal';
+
+    const header = document.createElement('div');
+    header.className = 'ss-preview-header';
+
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'ss-preview-title-wrap';
+
+    const title = document.createElement('h2');
+    title.textContent = getPreviewTitle(data).replace('Prévia', 'Pré-visualização');
+
+    const subtitle = document.createElement('div');
+    subtitle.className = 'ss-preview-subtitle';
+    subtitle.textContent = buildSubtitle(data);
+
+    titleWrap.append(title, subtitle);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'ss-preview-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = 'Fechar popup';
+    closeBtn.addEventListener('click', closePopup);
+
+    header.append(titleWrap, closeBtn);
+
+    const controls = document.createElement('div');
+    controls.className = 'ss-preview-controls';
+
+    const selectLabel = document.createElement('label');
+    selectLabel.textContent = 'Visualizar vagas de: ';
+
+    const select = createTipoVagaSelect(tipoSelecionado);
+    select.addEventListener('change', () => {
+      ultimoTipoSelecionado = select.value;
+
+      if (!contextoAtual) return;
+
+      const updatedData = collectPreviewData(contextoAtual);
+      if (!updatedData) return;
+
+      renderSidePanel(updatedData, ultimoTipoSelecionado);
+      renderPopup(updatedData, ultimoTipoSelecionado);
+    });
+
+    const refreshBtn = document.createElement('button');
+    refreshBtn.type = 'button';
+    refreshBtn.className = 'ss-preview-refresh';
+    refreshBtn.textContent = 'Atualizar prévia';
+    refreshBtn.addEventListener('click', () => {
+      if (!contextoAtual) return;
+
+      const updatedData = collectPreviewData(contextoAtual);
+      if (!updatedData) return;
+
+      renderPopup(updatedData, ultimoTipoSelecionado);
+    });
+
+    selectLabel.appendChild(select);
+    controls.append(selectLabel, refreshBtn);
+
+    const popupCalculator = renderVagasCalculator(data);
+
+    const body = document.createElement('div');
+    body.className = 'ss-preview-body';
+
+    const rows = buildPreviewRows(data, tipoSelecionado);
+    body.appendChild(renderSummary(data, rows, tipoSelecionado));
+    body.appendChild(renderRows(rows, data, tipoSelecionado));
+
+    modal.append(header, controls, popupCalculator, body);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    restorePopupState(previousState);
+  }
+
+  function closePopup(setState = true) {
+    const old = document.getElementById('ss-agenda-preview-overlay');
+    if (old) old.remove();
+
+    if (setState) {
+      popupAberto = false;
+    }
+  }
+
+  function renderTipoVagaSelector(data, tipoSelecionado) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'ss-tipo-vaga-radio-group';
+    wrapper.setAttribute('role', 'radiogroup');
+    wrapper.setAttribute('aria-label', 'Tipo de vaga visualizado');
+
+    const totals = getTotalVagasPorTipo(data);
+
+    Object.entries(TIPOS_VAGA).forEach(([key, info], index) => {
+      const label = document.createElement('label');
+      label.className = key === tipoSelecionado
+        ? 'ss-tipo-vaga-radio ss-tipo-vaga-radio-active'
+        : 'ss-tipo-vaga-radio';
+
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'ss-preview-tipo-vaga';
+      radio.value = key;
+      radio.checked = key === tipoSelecionado;
+
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+
+        ultimoTipoSelecionado = key;
+
+        if (!contextoAtual) return;
+
+        const updatedData = collectPreviewData(contextoAtual);
+        if (!updatedData) return;
+
+        renderSidePanel(updatedData, ultimoTipoSelecionado);
+      });
+
+      const text = document.createElement('span');
+      const labelText = key === 'reserva_tecnica' ? 'Reserva' : info.label;
+      text.textContent = `${labelText} ${totals[key] || 0}`;
+
+      label.append(radio, text);
+      wrapper.appendChild(label);
+
+      if (index < Object.keys(TIPOS_VAGA).length - 1) {
+        const separator = document.createElement('span');
+        separator.className = 'ss-tipo-vaga-separator';
+        separator.textContent = '|';
+        wrapper.appendChild(separator);
+      }
+    });
+
+    return wrapper;
+  }
+
+  function getTotalVagasPorTipo(data) {
+    const totals = {
+      nova_consulta: 0,
+      retorno: 0,
+      reserva_tecnica: 0,
+    };
+
+    data.days.forEach((day) => {
+      day.horarios.forEach((horario) => {
+        Object.keys(totals).forEach((tipo) => {
+          totals[tipo] += Number(horario.vagas[tipo] || 0);
+        });
+      });
+    });
+
+    return totals;
+  }
+
+  function createTipoVagaSelect(tipoSelecionado) {
+    const select = document.createElement('select');
+    select.className = 'ss-preview-tipo-vaga';
+
+    Object.entries(TIPOS_VAGA).forEach(([key, info]) => {
+      const opt = document.createElement('option');
+      opt.value = key;
+      opt.textContent = info.label;
+      opt.selected = key === tipoSelecionado;
+      select.appendChild(opt);
+    });
+
+    return select;
+  }
+
+  function collectPreviewData(context) {
+    if (!context) return null;
+
+    if (context.kind === 'agenda_especifica') {
+      return collectAgendaEspecificaData(context.key);
+    }
+
+    if (context.kind === 'mapa_periodo_valido') {
+      return collectMapaPeriodoValidoData(context.key);
+    }
+
+    return collectMapaPeriodoData(context.key);
+  }
+
+  function collectMapaPeriodoData(periodKey) {
+    const periodPrefix = `agenda[agendas_mapas_periodos_attributes][${periodKey}]`;
+    const fields = getNamedFieldsByPrefix(periodPrefix);
+
+    const dataInicial = getFieldValue(fields, `${periodPrefix}[data_inicial]`);
+    const dataFinal = getFieldValue(fields, `${periodPrefix}[data_final]`);
+    const possuiHorarioDistribuido = getCheckboxChecked(fields, `${periodPrefix}[possui_horario_distribuido]`);
+
+    const days = collectMapaDays(fields, periodPrefix, 'mapa_periodo');
+
+    return {
+      kind: 'mapa_periodo',
+      key: periodKey,
+      titulo: 'Período de vigência',
+      dataInicial,
+      dataFinal,
+      possuiHorarioDistribuido,
+      days,
+    };
+  }
+
+  function collectMapaPeriodoValidoData(periodKey) {
+    const periodPrefix = `agenda[agendas_mapas_periodos_validos_attributes][${periodKey}]`;
+    const fields = getNamedFieldsByPrefix(periodPrefix);
+
+    const dataInicial = getFieldValue(fields, `${periodPrefix}[data_inicial]`);
+    const dataFinal = getFieldValue(fields, `${periodPrefix}[data_final]`);
+    const possuiHorarioDistribuido = getMapaPeriodoValidoDistribuido(periodKey);
+
+    const days = collectMapaDays(fields, periodPrefix, 'mapa_periodo_valido');
+
+    return {
+      kind: 'mapa_periodo_valido',
+      key: periodKey,
+      titulo: 'Período já salvo',
+      dataInicial,
+      dataFinal,
+      possuiHorarioDistribuido,
+      days,
+    };
+  }
+
+  function collectMapaDays(fields, periodPrefix, kind) {
+    const daySelects = fields.filter((el) => {
+      return el.matches('select')
+        && el.name.includes('[agendas_mapas_dias_attributes]')
+        && el.name.endsWith('[dia_atendimento_id]')
+        && !isMarkedForDestroy(el);
+    });
+
+    return daySelects.map((daySelect) => {
+      const dayKey = extractMapaDiaKey(daySelect.name);
+      const dayPrefix = `${periodPrefix}[agendas_mapas_dias_attributes][${dayKey}]`;
+      const diaLabel = getSelectedOptionText(daySelect) || `Dia ${daySelect.value || 'não selecionado'}`;
+      const diaValor = daySelect.value || '';
+
+      const horarios = collectMapaHorarios(fields, dayPrefix, kind);
+
+      return {
+        dayKey,
+        diaValor,
+        diaLabel,
+        horarios,
+      };
+    }).sort((a, b) => {
+      const av = Number(a.diaValor || 999);
+      const bv = Number(b.diaValor || 999);
+      if (av !== bv) return av - bv;
+      return a.diaLabel.localeCompare(b.diaLabel, 'pt-BR');
+    });
+  }
+
+  function collectMapaHorarios(fields, dayPrefix, kind) {
+    const horarioInicioFields = fields.filter((el) => {
+      return el.name.startsWith(`${dayPrefix}[agendas_mapas_horarios_attributes]`)
+        && el.name.endsWith('[hora_inicio]')
+        && !isMarkedForDestroy(el);
+    });
+
+    return horarioInicioFields.map((horaInicioEl, index) => {
+      const horarioKey = extractMapaHorarioKey(horaInicioEl.name);
+      const horarioPrefix = `${dayPrefix}[agendas_mapas_horarios_attributes][${horarioKey}]`;
+
+      let observacao = getFieldValue(fields, `${horarioPrefix}[observacao]`);
+
+      /**
+       * Na edição de agenda já existente, observação salva pode virar texto fixo
+       * e deixar de ter input editável. Quando um novo horário é criado, volta
+       * a existir input normal.
+       */
+      if (!observacao && kind === 'mapa_periodo_valido') {
+        observacao = getStaticObservationNearHorario(horaInicioEl, index);
+      }
+
+      return {
+        horarioKey,
+        horaInicio: getFieldValue(fields, `${horarioPrefix}[hora_inicio]`),
+        horaFim: getFieldValue(fields, `${horarioPrefix}[hora_fim]`),
+        observacao,
+        vagas: {
+          nova_consulta: parseVagas(getFieldValue(fields, `${horarioPrefix}[nova_consulta]`)),
+          retorno: parseVagas(getFieldValue(fields, `${horarioPrefix}[retorno]`)),
+          reserva_tecnica: parseVagas(getFieldValue(fields, `${horarioPrefix}[reserva_tecnica]`)),
+        },
+      };
+    }).sort((a, b) => parseTimeToMinutes(a.horaInicio) - parseTimeToMinutes(b.horaInicio));
+  }
+
+  function collectAgendaEspecificaData(diaKey) {
+    const diaPrefix = `agenda[agendas_especificas_dias_attributes][${diaKey}]`;
+    const fields = getNamedFieldsByPrefix(diaPrefix);
+
+    const data = getFieldValue(fields, `${diaPrefix}[data]`);
+    const checkbox = findCheckboxByName(fields, `${diaPrefix}[possui_horario_distribuido]`);
+    const possuiHorarioDistribuido = checkbox
+      ? getCheckboxChecked(fields, `${diaPrefix}[possui_horario_distribuido]`)
+      : getAgendaEspecificaDistribuido(diaKey);
+
+    const horarios = collectAgendaEspecificaHorarios(fields, diaPrefix);
+
+    return {
+      kind: 'agenda_especifica',
+      key: diaKey,
+      titulo: 'Agenda específica',
+      data,
+      possuiHorarioDistribuido,
+      days: [
+        {
+          dayKey: diaKey,
+          diaValor: data || '',
+          diaLabel: data ? `Data ${data}` : 'Data não preenchida',
+          horarios,
+        },
+      ],
+    };
+  }
+
+  function collectAgendaEspecificaHorarios(fields, diaPrefix) {
+    const horarioInicioFields = fields.filter((el) => {
+      return el.name.startsWith(`${diaPrefix}[agendas_especificas_horarios_attributes]`)
+        && el.name.endsWith('[hora_inicio]')
+        && !isMarkedForDestroy(el);
+    });
+
+    return horarioInicioFields.map((horaInicioEl) => {
+      const horarioKey = extractEspecificaHorarioKey(horaInicioEl.name);
+      const horarioPrefix = `${diaPrefix}[agendas_especificas_horarios_attributes][${horarioKey}]`;
+
+      return {
+        horarioKey,
+        horaInicio: getFieldValue(fields, `${horarioPrefix}[hora_inicio]`),
+        horaFim: getFieldValue(fields, `${horarioPrefix}[hora_fim]`),
+        observacao: getFieldValue(fields, `${horarioPrefix}[observacao]`),
+        vagas: {
+          nova_consulta: parseVagas(getFieldValue(fields, `${horarioPrefix}[nova_consulta]`)),
+          retorno: parseVagas(getFieldValue(fields, `${horarioPrefix}[retorno]`)),
+          reserva_tecnica: parseVagas(getFieldValue(fields, `${horarioPrefix}[reserva_tecnica]`)),
+        },
+      };
+    }).sort((a, b) => parseTimeToMinutes(a.horaInicio) - parseTimeToMinutes(b.horaInicio));
+  }
+
+  function getPreviewTitle(data) {
+    if (data.kind === 'agenda_especifica') return 'Prévia da agenda específica';
+    if (data.kind === 'mapa_periodo_valido') return 'Prévia do período salvo';
+    return 'Prévia da agenda';
+  }
+
+  function buildSubtitle(data) {
+    const periodoTexto = data.kind === 'agenda_especifica'
+      ? (data.data ? `Data: ${data.data}` : 'Data não preenchida')
+      : (`Vigência: ${[data.dataInicial, data.dataFinal].filter(Boolean).join(' até ') || 'não preenchida'}`);
+
+    const modo = data.possuiHorarioDistribuido
+      ? 'separação: Distribuído'
+      : `separação: Por hora (${INTERVALO_POR_HORA_MINUTOS} em ${INTERVALO_POR_HORA_MINUTOS} minutos)`;
+
+    return `${periodoTexto} • ${modo}`;
+  }
+
+  function buildPreviewRows(data, tipoSelecionado) {
+    const rows = [];
+
+    data.days.forEach((day) => {
+      day.horarios.forEach((horario) => {
+        const vagas = Number(horario.vagas[tipoSelecionado] || 0);
+        const start = parseTimeToMinutes(horario.horaInicio);
+        const end = parseTimeToMinutes(horario.horaFim);
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+          rows.push({
+            type: 'error',
+            dayKey: day.dayKey,
+            diaValor: day.diaValor,
+            diaLabel: day.diaLabel,
+            sourceStart: horario.horaInicio,
+            sourceEnd: horario.horaFim,
+            observacao: horario.observacao,
+            message: `Horário inválido: ${horario.horaInicio || '(vazio)'} até ${horario.horaFim || '(vazio)'}`,
+          });
+          return;
+        }
+
+        /**
+         * Regra do Saúde Simples:
+         * hora_inicio igual a hora_fim não é inválido.
+         * Deve abrir um único horário, concentrando todas as vagas daquele tipo.
+         *
+         * Ex.: 08:30 até 08:30 com 4 vagas:
+         * 08:30 - 4 vagas
+         */
+        if (start === end) {
+          rows.push({
+            type: vagas > 0 ? 'slot' : 'zero',
+            dayKey: day.dayKey,
+            diaValor: day.diaValor,
+            diaLabel: day.diaLabel,
+            slotMin: start,
+            horario: formatMinutes(start),
+            observacao: cleanObservation(horario.observacao),
+            vagas,
+            sourceStart: horario.horaInicio,
+            sourceEnd: horario.horaFim,
+            message: vagas <= 0 ? 'Este horário está configurado com 0 vagas para o tipo selecionado.' : '',
+          });
+          return;
+        }
+
+        /**
+         * Horário distribuído:
+         * os tipos de vaga influenciam entre si.
+         *
+         * O sistema primeiro soma Primeira Vez + Retorno + Reserva Técnica,
+         * calcula os horários com base nesse total, e só depois separa a faixa
+         * que pertence a cada tipo.
+         *
+         * Ex.: 08:00 às 12:00 com 12 Retorno e 4 Reserva:
+         * total = 16 vagas
+         * slots = 08:00, 08:15, ..., 11:45
+         * Retorno = primeiros 12 slots
+         * Reserva = próximos 4 slots
+         */
+        if (data.possuiHorarioDistribuido) {
+          const totalVagasDistribuidas = getTotalVagasDistribuidas(horario);
+
+          if (vagas <= 0) {
+            rows.push({
+              type: 'zero',
+              dayKey: day.dayKey,
+              diaValor: day.diaValor,
+              diaLabel: day.diaLabel,
+              slotMin: start,
+              horario: formatMinutes(start),
+              observacao: cleanObservation(horario.observacao),
+              vagas: 0,
+              sourceStart: horario.horaInicio,
+              sourceEnd: horario.horaFim,
+              message: totalVagasDistribuidas > 0
+                ? 'Este horário existe no distribuído, mas o tipo selecionado está configurado com 0 vagas.'
+                : 'Este horário está configurado com 0 vagas em todos os tipos.',
+            });
+            return;
+          }
+
+          if (totalVagasDistribuidas <= 0) {
+            rows.push({
+              type: 'zero',
+              dayKey: day.dayKey,
+              diaValor: day.diaValor,
+              diaLabel: day.diaLabel,
+              slotMin: start,
+              horario: formatMinutes(start),
+              observacao: cleanObservation(horario.observacao),
+              vagas: 0,
+              sourceStart: horario.horaInicio,
+              sourceEnd: horario.horaFim,
+              message: 'Este horário está configurado com 0 vagas em todos os tipos.',
+            });
+            return;
+          }
+
+          const allSlots = buildDistributedSlots(start, end, totalVagasDistribuidas);
+          const range = getDistributedTypeRange(horario, tipoSelecionado);
+          const selectedSlots = allSlots.slice(range.startIndex, range.endIndex);
+
+          selectedSlots.forEach((slotMin) => {
+            rows.push({
+              type: 'slot',
+              dayKey: day.dayKey,
+              diaValor: day.diaValor,
+              diaLabel: day.diaLabel,
+              slotMin,
+              horario: formatMinutes(slotMin),
+              observacao: cleanObservation(horario.observacao),
+              vagas: 1,
+              sourceStart: horario.horaInicio,
+              sourceEnd: horario.horaFim,
+            });
+          });
+
+          return;
+        }
+
+        /**
+         * Sem horário distribuído:
+         * horários com 0 vagas aparecem como atenção.
+         */
+        if (vagas <= 0) {
+          rows.push({
+            type: 'zero',
+            dayKey: day.dayKey,
+            diaValor: day.diaValor,
+            diaLabel: day.diaLabel,
+            slotMin: start,
+            horario: formatMinutes(start),
+            observacao: cleanObservation(horario.observacao),
+            vagas: 0,
+            sourceStart: horario.horaInicio,
+            sourceEnd: horario.horaFim,
+            message: 'Este horário está configurado com 0 vagas para o tipo selecionado.',
+          });
+          return;
+        }
+
+        const buckets = buildHourlyBuckets(start, end, INTERVALO_POR_HORA_MINUTOS);
+
+        if (!buckets.length) {
+          rows.push({
+            type: 'error',
+            dayKey: day.dayKey,
+            diaValor: day.diaValor,
+            diaLabel: day.diaLabel,
+            sourceStart: horario.horaInicio,
+            sourceEnd: horario.horaFim,
+            observacao: horario.observacao,
+            message: `Intervalo menor que ${INTERVALO_POR_HORA_MINUTOS} minuto(s): ${horario.horaInicio} até ${horario.horaFim}`,
+          });
+          return;
+        }
+
+        distributeVagas(vagas, buckets.length).forEach((count, index) => {
+          if (count <= 0) return;
+
+          rows.push({
+            type: 'slot',
+            dayKey: day.dayKey,
+            diaValor: day.diaValor,
+            diaLabel: day.diaLabel,
+            slotMin: buckets[index],
+            horario: formatMinutes(buckets[index]),
+            observacao: cleanObservation(horario.observacao),
+            vagas: count,
+            sourceStart: horario.horaInicio,
+            sourceEnd: horario.horaFim,
+          });
+        });
+      });
+    });
+
+    return mergeRows(rows).sort((a, b) => {
+      const av = String(a.diaValor || '');
+      const bv = String(b.diaValor || '');
+
+      if (dataLooksLikeDateBR(av) && dataLooksLikeDateBR(bv)) {
+        const ad = parseDateBRToSortValue(av);
+        const bd = parseDateBRToSortValue(bv);
+        if (ad !== bd) return ad - bd;
+      } else {
+        const an = Number(a.diaValor || 999);
+        const bn = Number(b.diaValor || 999);
+        if (an !== bn) return an - bn;
+      }
+
+      if (a.type !== b.type) return a.type === 'slot' ? -1 : 1;
+      return (a.slotMin || 0) - (b.slotMin || 0);
+    });
+  }
+
+  function getTotalVagasDistribuidas(horario) {
+    return ORDEM_TIPOS_DISTRIBUIDO.reduce((sum, tipo) => {
+      return sum + Number(horario.vagas[tipo] || 0);
+    }, 0);
+  }
+
+  function getDistributedTypeRange(horario, tipoSelecionado) {
+    let startIndex = 0;
+
+    for (const tipo of ORDEM_TIPOS_DISTRIBUIDO) {
+      const quantidade = Number(horario.vagas[tipo] || 0);
+
+      if (tipo === tipoSelecionado) {
+        return {
+          startIndex,
+          endIndex: startIndex + quantidade,
+        };
+      }
+
+      startIndex += quantidade;
+    }
+
+    return {
+      startIndex: 0,
+      endIndex: 0,
+    };
+  }
+
+  function buildDistributedSlots(startMin, endMin, vagas) {
+    const result = [];
+    if (vagas <= 0) return result;
+
+    const startSeconds = startMin * 60;
+    const endSeconds = endMin * 60;
+    const durationSeconds = endSeconds - startSeconds;
+    const stepSeconds = durationSeconds / vagas;
+
+    for (let i = 0; i < vagas; i += 1) {
+      const rawSeconds = startSeconds + (stepSeconds * i);
+      const slotMin = roundSecondsToMinute(rawSeconds);
+      result.push(slotMin);
+    }
+
+    return result;
+  }
+
+  function roundSecondsToMinute(seconds) {
+    const minutes = seconds / 60;
+
+    if (ARREDONDAMENTO_DISTRIBUIDO === 'round') {
+      return Math.round(minutes);
+    }
+
+    if (ARREDONDAMENTO_DISTRIBUIDO === 'ceil') {
+      return Math.ceil(minutes);
+    }
+
+    return Math.floor(minutes);
+  }
+
+  function buildHourlyBuckets(startMin, endMin, stepMin) {
+    const buckets = [];
+
+    /**
+     * O horário final não vira horário aberto.
+     * Ex.: 08:00 até 10:00:
+     * abre 08:00 e 09:00, não abre 10:00.
+     */
+    for (let min = startMin; min + stepMin <= endMin; min += stepMin) {
+      buckets.push(min);
+    }
+
+    return buckets;
+  }
+
+  function distributeVagas(total, bucketsLength) {
+    const result = Array.from({ length: bucketsLength }, () => 0);
+    if (total <= 0 || bucketsLength <= 0) return result;
+
+    const base = Math.floor(total / bucketsLength);
+    let remainder = total % bucketsLength;
+
+    for (let i = 0; i < bucketsLength; i += 1) {
+      result[i] = base;
+
+      const shouldReceiveRemainder = DISTRIBUIR_SOBRA_NOS_PRIMEIROS_HORARIOS
+        ? i < (total % bucketsLength)
+        : i >= bucketsLength - (total % bucketsLength);
+
+      if (remainder > 0 && shouldReceiveRemainder) {
+        result[i] += 1;
+        remainder -= 1;
+      }
+    }
+
+    return result;
+  }
+
+  function renderVagasCalculator(data) {
+    const wrapper = document.createElement('section');
+    wrapper.className = 'ss-vagas-calculator';
+
+    const header = document.createElement('div');
+    header.className = 'ss-vagas-calculator-header';
+
+    const title = document.createElement('strong');
+    title.textContent = 'Calculadora de vagas';
+
+    const explanation = document.createElement('span');
+    explanation.textContent = 'Calcule o total necessário para abrir uma vaga a cada intervalo desejado.';
+
+    header.append(title, explanation);
+
+    const controls = document.createElement('div');
+    controls.className = 'ss-vagas-calculator-controls';
+
+    const label = document.createElement('label');
+    label.textContent = 'Uma vaga a cada ';
+
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.step = '1';
+    input.value = String(calculadoraIntervaloMinutos);
+    input.className = 'ss-vagas-calculator-input';
+
+    const suffix = document.createElement('span');
+    suffix.textContent = ' minuto(s)';
+
+    label.append(input, suffix);
+
+    const quickButtons = document.createElement('div');
+    quickButtons.className = 'ss-vagas-calculator-quick';
+
+    [5, 10, 15, 20, 30, 60].forEach((minutes) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `${minutes}m`;
+      button.className = minutes === calculadoraIntervaloMinutos
+        ? 'ss-vagas-calculator-chip ss-vagas-calculator-chip-active'
+        : 'ss-vagas-calculator-chip';
+
+      button.addEventListener('click', () => {
+        calculadoraIntervaloMinutos = minutes;
+        const currentPanelData = contextoAtual ? collectPreviewData(contextoAtual) : data;
+        if (currentPanelData) {
+          updateCalculatorSection(wrapper, currentPanelData);
+        }
+      });
+
+      quickButtons.appendChild(button);
+    });
+
+    controls.append(label, quickButtons);
+
+    const result = document.createElement('div');
+    result.className = 'ss-vagas-calculator-result';
+
+    wrapper.append(header, controls, result);
+
+    input.addEventListener('input', () => {
+      const parsed = Number(input.value);
+      calculadoraIntervaloMinutos = Number.isFinite(parsed) && parsed > 0
+        ? Math.floor(parsed)
+        : 1;
+
+      const currentPanelData = contextoAtual ? collectPreviewData(contextoAtual) : data;
+      if (currentPanelData) {
+        updateCalculatorSection(wrapper, currentPanelData);
+      }
+    });
+
+    updateCalculatorSection(wrapper, data);
+
+    return wrapper;
+  }
+
+  function updateCalculatorSection(wrapper, data) {
+    const input = wrapper.querySelector('.ss-vagas-calculator-input');
+    if (input && String(input.value) !== String(calculadoraIntervaloMinutos)) {
+      input.value = String(calculadoraIntervaloMinutos);
+    }
+
+    wrapper.querySelectorAll('.ss-vagas-calculator-chip').forEach((button) => {
+      button.classList.toggle(
+        'ss-vagas-calculator-chip-active',
+        button.textContent === `${calculadoraIntervaloMinutos}m`
+      );
+    });
+
+    const result = wrapper.querySelector('.ss-vagas-calculator-result');
+    if (!result) return;
+
+    result.innerHTML = '';
+
+    const calculations = buildCalculatorRows(data, calculadoraIntervaloMinutos);
+
+    if (!calculations.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ss-vagas-calculator-empty';
+      empty.textContent = 'Preencha horário de início e término para calcular.';
+      result.appendChild(empty);
+      return;
+    }
+
+    calculations.forEach((calc) => {
+      const card = document.createElement('div');
+      card.className = calc.diff === 0
+        ? 'ss-vagas-calculator-card ss-vagas-calculator-ok'
+        : 'ss-vagas-calculator-card ss-vagas-calculator-alert';
+
+      const title = document.createElement('div');
+      title.className = 'ss-vagas-calculator-card-title';
+      title.textContent = `${calc.diaLabel} • ${calc.horaInicio} às ${calc.horaFim}`;
+
+      const meta = document.createElement('div');
+      meta.className = 'ss-vagas-calculator-card-meta';
+      meta.textContent = calc.observacao
+        ? calc.observacao
+        : 'Sem observação';
+
+      const line = document.createElement('div');
+      line.className = 'ss-vagas-calculator-card-line';
+
+      const atual = document.createElement('span');
+      atual.innerHTML = `<b>Atual:</b> ${calc.totalAtual}`;
+
+      const necessario = document.createElement('span');
+      necessario.innerHTML = `<b>Necessário:</b> ${calc.totalNecessario}`;
+
+      const diff = document.createElement('span');
+      if (calc.diff === 0) {
+        diff.innerHTML = '<b>Diferença:</b> OK';
+      } else if (calc.diff > 0) {
+        diff.innerHTML = `<b>Diferença:</b> +${calc.diff}`;
+      } else {
+        diff.innerHTML = `<b>Diferença:</b> ${calc.diff}`;
+      }
+
+      line.append(atual, necessario, diff);
+
+      const detail = document.createElement('div');
+      detail.className = 'ss-vagas-calculator-card-detail';
+
+      if (calc.diff === 0) {
+        detail.textContent = `A soma das vagas já gera aproximadamente 1 vaga a cada ${calculadoraIntervaloMinutos} minuto(s).`;
+      } else if (calc.diff > 0) {
+        detail.textContent = `Adicione ${calc.diff} vaga(s) na soma de Primeira Vez + Retorno + Reserva Técnica.`;
+      } else {
+        detail.textContent = `Remova ${Math.abs(calc.diff)} vaga(s) da soma de Primeira Vez + Retorno + Reserva Técnica.`;
+      }
+
+      const distribution = document.createElement('div');
+      distribution.className = 'ss-vagas-calculator-card-distribution';
+      distribution.textContent = `Atual por tipo: Primeira Vez ${calc.atualPorTipo.nova_consulta}, Retorno ${calc.atualPorTipo.retorno}, Reserva Técnica ${calc.atualPorTipo.reserva_tecnica}.`;
+
+      card.append(title, meta, line, detail, distribution);
+      result.appendChild(card);
+    });
+  }
+
+  function buildCalculatorRows(data, intervaloMinutos) {
+    const rows = [];
+
+    if (!Number.isFinite(intervaloMinutos) || intervaloMinutos <= 0) return rows;
+
+    data.days.forEach((day) => {
+      day.horarios.forEach((horario) => {
+        const start = parseTimeToMinutes(horario.horaInicio);
+        const end = parseTimeToMinutes(horario.horaFim);
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return;
+
+        const duracao = end - start;
+
+        /**
+         * Mesmo caso especial da prévia:
+         * 08:30 até 08:30 abre um horário único.
+         */
+        const totalNecessario = duracao === 0
+          ? 1
+          : Math.ceil(duracao / intervaloMinutos);
+
+        const atualPorTipo = {
+          nova_consulta: Number(horario.vagas.nova_consulta || 0),
+          retorno: Number(horario.vagas.retorno || 0),
+          reserva_tecnica: Number(horario.vagas.reserva_tecnica || 0),
+        };
+
+        const totalAtual = atualPorTipo.nova_consulta
+          + atualPorTipo.retorno
+          + atualPorTipo.reserva_tecnica;
+
+        rows.push({
+          diaLabel: day.diaLabel || 'Dia/Data não selecionado',
+          horaInicio: horario.horaInicio || '?',
+          horaFim: horario.horaFim || '?',
+          observacao: cleanObservation(horario.observacao),
+          totalAtual,
+          totalNecessario,
+          diff: totalNecessario - totalAtual,
+          atualPorTipo,
+        });
+      });
+    });
+
+    return rows;
+  }
+
+  function buildValidationWarnings(data) {
+    const warnings = [];
+
+    data.days.forEach((day) => {
+      const intervals = [];
+
+      day.horarios.forEach((horario, index) => {
+        const start = parseTimeToMinutes(horario.horaInicio);
+        const end = parseTimeToMinutes(horario.horaFim);
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return;
+
+        const totalVagas = getTotalVagasDistribuidas(horario);
+        const duration = end - start;
+
+        if (data.possuiHorarioDistribuido && duration > 0 && totalVagas > duration) {
+          warnings.push({
+            type: 'error',
+            diaLabel: day.diaLabel,
+            title: 'Vagas demais para distribuir por minuto',
+            message: `${day.diaLabel}: ${horario.horaInicio} às ${horario.horaFim} possui ${totalVagas} vaga(s) para ${duration} minuto(s). O limite para manter separação mínima de 1 minuto é ${duration} vaga(s).`,
+          });
+        }
+
+        intervals.push({
+          index,
+          start,
+          end,
+          effectiveEnd: end === start ? start + 1 : end,
+          label: `${horario.horaInicio || '?'} às ${horario.horaFim || '?'}`,
+        });
+      });
+
+      for (let i = 0; i < intervals.length; i += 1) {
+        for (let j = i + 1; j < intervals.length; j += 1) {
+          const a = intervals[i];
+          const b = intervals[j];
+
+          const overlaps = a.start < b.effectiveEnd && b.start < a.effectiveEnd;
+
+          if (!overlaps) continue;
+
+          warnings.push({
+            type: 'error',
+            diaLabel: day.diaLabel,
+            title: 'Horários sobrepostos',
+            message: `${day.diaLabel}: ${a.label} sobrepõe ${b.label}. O sistema bloqueia isso ao salvar. Horários encostados, como 08:00 às 09:00 e 09:00 às 10:00, são permitidos.`,
+          });
+        }
+      }
+    });
+
+    return warnings;
+  }
+
+  function renderValidationWarnings(warnings) {
+    const wrapper = document.createElement('div');
+    wrapper.className = 'ss-validation-warnings';
+
+    warnings.forEach((warning) => {
+      const card = document.createElement('div');
+      card.className = 'ss-validation-warning-card';
+
+      const title = document.createElement('strong');
+      title.textContent = warning.title;
+
+      const message = document.createElement('span');
+      message.textContent = warning.message;
+
+      card.append(title, message);
+      wrapper.appendChild(card);
+    });
+
+    return wrapper;
+  }
+
+  function renderSummary(data, rows, tipoSelecionado, extraWarnings = 0) {
+    /**
+     * "Tipo visualizado" e "Total de vagas" foram removidos daqui,
+     * porque essas informações já aparecem no seletor compacto:
+     * ( ) Primeira Vez X | ( ) Retorno X | ( ) Reserva X
+     */
+    const totalHorarios = rows.filter((row) => row.type === 'slot' || row.type === 'zero').length;
+    const totalErros = rows.filter((row) => row.type === 'error' || row.type === 'zero').length + extraWarnings;
+    const labelDias = data.kind === 'agenda_especifica' ? 'Datas' : 'Dias configurados';
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'ss-preview-summary ss-preview-summary-compact';
+
+    wrapper.append(
+      createSummaryCard('Horários abertos', String(totalHorarios)),
+      createSummaryCard(labelDias, String(data.days.length))
+    );
+
+    if (totalErros > 0) {
+      wrapper.append(createSummaryCard('Atenções', String(totalErros), true));
+    }
+
+    return wrapper;
+  }
+
+  function createSummaryCard(label, value, warn = false) {
+    const card = document.createElement('div');
+    card.className = warn ? 'ss-summary-card ss-summary-warn' : 'ss-summary-card';
+
+    const small = document.createElement('small');
+    small.textContent = label;
+
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+
+    card.append(small, strong);
+    return card;
+  }
+
+  function renderRows(rows, data, tipoSelecionado) {
+    const container = document.createElement('div');
+    container.className = 'ss-preview-list';
+
+    const validRows = rows.filter((row) => row.type === 'slot' || row.type === 'zero');
+    const errorRows = rows.filter((row) => row.type === 'error');
+
+    if (!validRows.length && !errorRows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'ss-preview-empty';
+      empty.textContent = `Nenhuma vaga de ${TIPOS_VAGA[tipoSelecionado].label} encontrada nesta configuração.`;
+      container.appendChild(empty);
+      return container;
+    }
+
+    const grouped = groupBy(validRows, (row) => row.dayKey || row.diaLabel);
+
+    data.days.forEach((day) => {
+      const key = day.dayKey || day.diaLabel;
+      const dayRows = grouped.get(key) || [];
+      const dayErrors = errorRows.filter((row) => (row.dayKey || row.diaLabel) === key);
+
+      if (!dayRows.length && !dayErrors.length) return;
+
+      const section = document.createElement('section');
+      section.className = 'ss-preview-day-section';
+
+      const h3 = document.createElement('h3');
+      h3.textContent = day.diaLabel || 'Dia/Data não selecionado';
+      section.appendChild(h3);
+
+      dayRows.forEach((row) => {
+        const line = document.createElement('div');
+        line.className = row.type === 'zero'
+          ? 'ss-preview-line ss-preview-line-zero'
+          : 'ss-preview-line';
+
+        const time = document.createElement('span');
+        time.className = 'ss-preview-time';
+        time.textContent = row.horario;
+
+        const text = document.createElement('span');
+        text.className = 'ss-preview-text';
+        text.textContent = `${row.observacao || 'Sem observação'} (${row.vagas} ${row.vagas === 1 ? 'Vaga' : 'Vagas'})${row.type === 'zero' ? ' ⚠️' : ''}`;
+
+        const source = document.createElement('span');
+        source.className = 'ss-preview-source';
+        source.textContent = `${row.sourceStart || '?'} às ${row.sourceEnd || '?'}`;
+
+        line.append(time, text, source);
+        section.appendChild(line);
+
+        if (row.type === 'zero' && row.message) {
+          const warn = document.createElement('div');
+          warn.className = 'ss-preview-warning ss-preview-warning-zero';
+          warn.textContent = row.message;
+          section.appendChild(warn);
+        }
+      });
+
+      dayErrors.forEach((row) => {
+        const warn = document.createElement('div');
+        warn.className = 'ss-preview-warning';
+        warn.textContent = row.message;
+        section.appendChild(warn);
+      });
+
+      container.appendChild(section);
+    });
+
+    return container;
+  }
+
+  function mergeRows(rows) {
+    const normal = [];
+    const slotMap = new Map();
+
+    rows.forEach((row) => {
+      if (row.type !== 'slot' && row.type !== 'zero') {
+        normal.push(row);
+        return;
+      }
+
+      const key = [
+        row.dayKey,
+        row.diaValor,
+        row.diaLabel,
+        row.slotMin,
+        row.observacao,
+        row.sourceStart,
+        row.sourceEnd,
+      ].join('|');
+
+      if (!slotMap.has(key)) {
+        slotMap.set(key, { ...row });
+      } else {
+        slotMap.get(key).vagas += row.vagas;
+      }
+    });
+
+    return [...slotMap.values(), ...normal];
+  }
+
+  function getMapaPeriodoValidoDistribuido(periodKey) {
+    const element = findMapaPeriodoValidoSeparationElement(periodKey);
+    const text = normalizeText(element ? element.textContent : '');
+
+    if (/distribu[ií]do/i.test(text)) return true;
+    if (/por\s*hora/i.test(text)) return false;
+
+    /**
+     * Fallback: procura no bloco do período salvo.
+     */
+    const dataInicial = findMapaPeriodoValidoDataInicialElement(periodKey);
+    const container = findSmallestContextContainerWithText(dataInicial, /(distribu[ií]do|por\s*hora)/i);
+
+    const containerText = normalizeText(container ? container.textContent : '');
+
+    if (/distribu[ií]do/i.test(containerText) && !/por\s*hora/i.test(containerText)) return true;
+    if (/por\s*hora/i.test(containerText) && !/distribu[ií]do/i.test(containerText)) return false;
+
+    /**
+     * Se não conseguir identificar, assume Por hora para evitar simular
+     * distribuição indevidamente.
+     */
+    return false;
+  }
+
+  function getAgendaEspecificaDistribuido(diaKey) {
+    const element = findAgendaEspecificaSeparationElement(diaKey);
+    const text = normalizeText(element ? element.textContent : '');
+
+    if (/distribu[ií]do/i.test(text)) return true;
+    if (/por\s*hora/i.test(text)) return false;
+
+    /**
+     * Fallback: procura no bloco da agenda específica salva.
+     */
+    const dataElement = findAgendaEspecificaDataElement(diaKey);
+    const container = findSmallestContextContainerWithText(dataElement, /(distribu[ií]do|por\s*hora)/i);
+    const containerText = normalizeText(container ? container.textContent : '');
+
+    if (/distribu[ií]do/i.test(containerText) && !/por\s*hora/i.test(containerText)) return true;
+    if (/por\s*hora/i.test(containerText) && !/distribu[ií]do/i.test(containerText)) return false;
+
+    /**
+     * Se não conseguir identificar, assume Por hora para evitar simular
+     * distribuição indevidamente.
+     */
+    return false;
+  }
+
+  function findAgendaEspecificaSeparationElement(diaKey) {
+    const dataElement = findAgendaEspecificaDataElement(diaKey);
+    if (!dataElement) return null;
+
+    const container = findSmallestContextContainerWithText(dataElement, /(distribu[ií]do|por\s*hora)/i);
+    if (!container) return null;
+
+    const candidates = Array.from(container.querySelectorAll('li, span, div, td, p')).filter((el) => {
+      if (!isVisible(el)) return false;
+
+      const text = normalizeText(el.textContent);
+      if (!/(distribu[ií]do|por\s*hora)/i.test(text)) return false;
+
+      /**
+       * Evita pegar labels internos/accessors e o próprio botão.
+       */
+      if (/possui\s*hor[aá]rio\s*distribu[ií]do/i.test(text)) return false;
+      if (/accessor/i.test(text)) return false;
+      if (/pr[eé][-\s]*visualizar/i.test(text)) return false;
+
+      /**
+       * Evita pegar um bloco gigante com vários campos.
+       */
+      return text.length <= 80;
+    });
+
+    candidates.sort((a, b) => {
+      const aText = normalizeText(a.textContent);
+      const bText = normalizeText(b.textContent);
+      const aExact = /^(distribu[ií]do|por\s*hora)$/i.test(aText) ? 0 : 1;
+      const bExact = /^(distribu[ií]do|por\s*hora)$/i.test(bText) ? 0 : 1;
+      if (aExact !== bExact) return aExact - bExact;
+      return aText.length - bText.length;
+    });
+
+    return candidates[0] || container;
+  }
+
+  function findAgendaEspecificaDataElement(diaKey) {
+    const name = `agenda[agendas_especificas_dias_attributes][${diaKey}][data]`;
+    return document.querySelector(`[name="${cssEscape(name)}"]`);
+  }
+
+  function findMapaPeriodoValidoSeparationElement(periodKey) {
+    const dataInicial = findMapaPeriodoValidoDataInicialElement(periodKey);
+    if (!dataInicial) return null;
+
+    const container = findSmallestContextContainerWithText(dataInicial, /(distribu[ií]do|por\s*hora)/i);
+    if (!container) return null;
+
+    const candidates = Array.from(container.querySelectorAll('li, span, div, td, p')).filter((el) => {
+      if (!isVisible(el)) return false;
+
+      const text = normalizeText(el.textContent);
+      if (!/(distribu[ií]do|por\s*hora)/i.test(text)) return false;
+
+      /**
+       * Evita pegar um bloco gigante com vários campos.
+       */
+      return text.length <= 80;
+    });
+
+    candidates.sort((a, b) => {
+      const at = normalizeText(a.textContent).length;
+      const bt = normalizeText(b.textContent).length;
+      return at - bt;
+    });
+
+    return candidates[0] || container;
+  }
+
+  function findSmallestContextContainerWithText(startEl, regex) {
+    if (!startEl) return null;
+
+    let node = startEl.parentElement;
+    let best = null;
+
+    for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+      const text = normalizeText(node.textContent);
+      if (!regex.test(text)) continue;
+
+      /**
+       * Preferimos containers que aparentemente pertencem a um único período
+       * ou a uma única agenda específica salva.
+       *
+       * Isso evita confundir "Por hora" de uma agenda com "Distribuído" de outra
+       * quando há várias agendas específicas dentro de #add_item.
+       */
+      const validPeriodDataFields = Array.from(node.querySelectorAll('input[name$="[data_inicial]"]')).filter((input) => {
+        return input.name && input.name.includes('agenda[agendas_mapas_periodos_validos_attributes]');
+      });
+
+      const specificDateFields = Array.from(node.querySelectorAll('input[name$="[data]"]')).filter((input) => {
+        return input.name && input.name.includes('agenda[agendas_especificas_dias_attributes]');
+      });
+
+      const totalContextMarkers = validPeriodDataFields.length + specificDateFields.length;
+
+      if (totalContextMarkers <= 1) {
+        best = node;
+        break;
+      }
+
+      if (!best) {
+        best = node;
+      }
+    }
+
+    return best;
+  }
+
+  function findMapaPeriodoValidoDataInicialElement(periodKey) {
+    const name = `agenda[agendas_mapas_periodos_validos_attributes][${periodKey}][data_inicial]`;
+    return document.querySelector(`[name="${cssEscape(name)}"]`);
+  }
+
+  function getStaticObservationNearHorario(horaInicioEl, index) {
+    const row = findHorarioRowContainer(horaInicioEl);
+
+    if (row) {
+      const byLabel = findObservationTextByLabel(row);
+      if (byLabel) return byLabel;
+
+      const bySecondLi = findObservationTextBySecondLi(row);
+      if (bySecondLi) return bySecondLi;
+    }
+
+    /**
+     * Fallback: se a linha exata não for encontrada, tenta usar o índice
+     * dentro do container geral de horários.
+     */
+    const horariosContainer = horaInicioEl.closest('.horarios') || horaInicioEl.closest('.fields');
+    if (horariosContainer) {
+      const rows = Array.from(horariosContainer.querySelectorAll('.grid_16, .fields')).filter((el) => {
+        return el.querySelector('input[name$="[hora_inicio]"]');
+      });
+
+      const fallbackRow = rows[index];
+      if (fallbackRow) {
+        return findObservationTextByLabel(fallbackRow) || findObservationTextBySecondLi(fallbackRow) || '';
+      }
+    }
+
+    return '';
+  }
+
+  function findHorarioRowContainer(horaInicioEl) {
+    if (!horaInicioEl) return null;
+
+    let node = horaInicioEl.parentElement;
+
+    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+      if (
+        node.matches('.grid_16')
+        || (
+          node.classList
+          && node.classList.contains('fields')
+          && node.querySelector('input[name$="[hora_inicio]"]')
+          && node.querySelector('input[name$="[hora_fim]"]')
+        )
+      ) {
+        return node;
+      }
+    }
+
+    return horaInicioEl.closest('.grid_16') || horaInicioEl.closest('.fields') || null;
+  }
+
+  function findObservationTextByLabel(container) {
+    const candidates = Array.from(container.querySelectorAll('li, div, span, p, td')).filter((el) => {
+      const text = normalizeText(el.textContent);
+      return /observa[cç][aã]o/i.test(text);
+    });
+
+    for (const el of candidates) {
+      const text = cleanStaticObservationText(extractDisplayText(el));
+      if (text) return text;
+    }
+
+    return '';
+  }
+
+  function findObservationTextBySecondLi(container) {
+    const directChildren = Array.from(container.children || []).filter((el) => {
+      return el.tagName && el.tagName.toLowerCase() === 'li';
+    });
+
+    const li = directChildren[1] || container.querySelector(':scope > li:nth-child(2)');
+    if (!li) return '';
+
+    /**
+     * Evita pegar um <li> de outro nível do formulário, como o campo
+     * "Possui horário distribuído", quando a observação salva está vazia.
+     */
+    const text = cleanStaticObservationText(extractDisplayText(li));
+    if (!text) return '';
+
+    return text;
+  }
+
+  function extractDisplayText(el) {
+    if (!el) return '';
+
+    const clone = el.cloneNode(true);
+
+    clone.querySelectorAll('input, select, textarea, button, script, style').forEach((node) => {
+      node.remove();
+    });
+
+    return normalizeText(clone.textContent);
+  }
+
+  function cleanStaticObservationText(text) {
+    let clean = normalizeText(text);
+
+    clean = clean
+      .replace(/^observa[cç][aã]o\s*:?\s*/i, '')
+      .replace(/^observa[cç][aã]o/i, '')
+      .trim();
+
+    /**
+     * Em agendas já salvas, quando a observação está nula ("—"),
+     * alguns containers próximos podem acabar expondo textos internos do Rails/Formtastic,
+     * como "Possui horario distribuido accessor".
+     *
+     * Esses textos não são observação real e devem ser tratados como vazio.
+     */
+    const lower = clean
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+
+    const invalidObservationFragments = [
+      'possui horario distribuido',
+      'horario distribuido accessor',
+      'accessor',
+      'separacao',
+      'por hora',
+      'distribuido',
+      'data inicial',
+      'data final',
+      'dia da semana',
+      'hora inicio',
+      'hora termino',
+      'horario de inicio',
+      'horario de termino',
+      'nova consulta',
+      'primeira vez',
+      'retorno',
+      'reserva tecnica',
+      'vagas',
+    ];
+
+    if (
+      !clean
+      || clean === '—'
+      || clean === '-'
+      || clean === '--'
+      || invalidObservationFragments.some((fragment) => lower.includes(fragment))
+    ) {
+      return '';
+    }
+
+    return clean;
+  }
+
+  function captureSidePanelState(panel) {
+    if (!panel) {
+      return {
+        bodyScrollTop: 0,
+      };
+    }
+
+    const body = panel.querySelector('.ss-side-body');
+
+    return {
+      bodyScrollTop: body ? body.scrollTop : 0,
+    };
+  }
+
+  function restoreSidePanelState(panel, state) {
+    if (!panel || !state) return;
+
+    const body = panel.querySelector('.ss-side-body');
+
+    requestAnimationFrame(() => {
+      if (body) {
+        body.scrollTop = state.bodyScrollTop || 0;
+      }
+    });
+  }
+
+  function capturePopupState() {
+    const modal = document.getElementById('ss-agenda-preview-modal');
+    const body = modal ? modal.querySelector('.ss-preview-body') : null;
+
+    return {
+      modalScrollTop: modal ? modal.scrollTop : 0,
+      bodyScrollTop: body ? body.scrollTop : 0,
+    };
+  }
+
+  function restorePopupState(state) {
+    if (!state) return;
+
+    requestAnimationFrame(() => {
+      const modal = document.getElementById('ss-agenda-preview-modal');
+      const body = modal ? modal.querySelector('.ss-preview-body') : null;
+
+      if (modal) {
+        modal.scrollTop = state.modalScrollTop || 0;
+      }
+
+      if (body) {
+        body.scrollTop = state.bodyScrollTop || 0;
+      }
+    });
+  }
+
+  function isPreviewUiElement(target) {
+    if (!target || !target.closest) return false;
+
+    return Boolean(
+      target.closest('#ss-agenda-preview-side-panel')
+      || target.closest('#ss-agenda-preview-overlay')
+    );
+  }
+
+  function makeContextId(context) {
+    return `${context.kind}:${context.key}`;
+  }
+
+  function startLivePolling() {
+    stopLivePolling();
+
+    livePollTimer = window.setInterval(() => {
+      if (!contextoAtual || document.hidden) return;
+      if (document.querySelector('#ss-agenda-preview-side-panel:focus-within')) return;
+
+      const data = collectPreviewData(contextoAtual);
+      if (!data) return;
+
+      const signature = getPreviewSignature(data);
+
+      if (signature !== lastPreviewSignature) {
+        renderSidePanel(data, ultimoTipoSelecionado);
+      }
+    }, 700);
+  }
+
+  function stopLivePolling() {
+    if (livePollTimer) {
+      window.clearInterval(livePollTimer);
+      livePollTimer = null;
+    }
+
+    lastPreviewSignature = '';
+  }
+
+  function getPreviewSignature(data) {
+    if (!data) return '';
+
+    return JSON.stringify({
+      kind: data.kind,
+      key: data.key,
+      data: data.data || '',
+      dataInicial: data.dataInicial || '',
+      dataFinal: data.dataFinal || '',
+      possuiHorarioDistribuido: Boolean(data.possuiHorarioDistribuido),
+      days: data.days.map((day) => ({
+        dayKey: day.dayKey,
+        diaValor: day.diaValor,
+        diaLabel: day.diaLabel,
+        horarios: day.horarios.map((horario) => ({
+          horaInicio: horario.horaInicio,
+          horaFim: horario.horaFim,
+          observacao: horario.observacao,
+          vagas: horario.vagas,
+        })),
+      })),
+    });
+  }
+
+  function isAgendaField(target) {
+    return Boolean(
+      target
+      && target.name
+      && (
+        target.name.includes('agendas_mapas_periodos')
+        || target.name.includes('agendas_mapas_periodos_validos')
+        || target.name.includes('agendas_especificas_dias')
+      )
+    );
+  }
+
+  function parseTimeToMinutes(value) {
+    if (!value) return NaN;
+
+    const match = String(value).trim().match(/^(\d{1,2}):(\d{2})/);
+    if (!match) return NaN;
+
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return NaN;
+
+    return hours * 60 + minutes;
+  }
+
+  function formatMinutes(totalMinutes) {
+    const hours = Math.floor(totalMinutes / 60) % 24;
+    const minutes = totalMinutes % 60;
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  }
+
+  function parseVagas(value) {
+    const clean = String(value || '').replace(/\D+/g, '');
+    return clean ? Number(clean) : 0;
+  }
+
+  function cleanObservation(value) {
+    const text = cleanStaticObservationText(String(value || '').trim().replace(/\s+/g, ' '));
+    if (!text) return '';
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  function dataLooksLikeDateBR(value) {
+    return /^\d{2}\/\d{2}\/\d{4}$/.test(String(value || '').trim());
+  }
+
+  function parseDateBRToSortValue(value) {
+    const match = String(value || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (!match) return 0;
+
+    const [, dd, mm, yyyy] = match;
+    return Number(`${yyyy}${mm}${dd}`);
+  }
+
+  function normalizeText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function getAllNamedFields() {
+    return Array.from(document.querySelectorAll('input[name], select[name], textarea[name]'));
+  }
+
+  function getNamedFieldsByPrefix(prefix) {
+    return getAllNamedFields().filter((el) => el.name && el.name.startsWith(prefix));
+  }
+
+  function findByName(fields, name) {
+    return fields.find((el) => el.name === name) || null;
+  }
+
+  function findCheckboxByName(fields, name) {
+    return fields.find((el) => el.name === name && el.matches('input[type="checkbox"]')) || null;
+  }
+
+  function getCheckboxChecked(fields, name) {
+    const checkbox = findCheckboxByName(fields, name);
+    return Boolean(checkbox && checkbox.checked);
+  }
+
+  function getFieldValue(fields, name) {
+    /**
+     * Para campos com name duplicado, evita pegar hidden por engano
+     * quando existir checkbox real.
+     */
+    const checkbox = findCheckboxByName(fields, name);
+    if (checkbox) return checkbox.checked ? '1' : '0';
+
+    const el = findByName(fields, name);
+    if (!el) return '';
+    return el.value || '';
+  }
+
+  function getSelectedOptionText(select) {
+    if (!select) return '';
+
+    const option = select.options[select.selectedIndex];
+    return option ? option.textContent.trim() : '';
+  }
+
+  function extractMapaPeriodoKey(name) {
+    const match = String(name || '').match(MAPA_PERIODO_RE);
+    return match ? match[1] : null;
+  }
+
+  function extractMapaPeriodoValidoKey(name) {
+    const match = String(name || '').match(MAPA_PERIODO_VALIDO_RE);
+    return match ? match[1] : null;
+  }
+
+  function extractMapaDiaKey(name) {
+    const match = String(name || '').match(MAPA_DIA_RE);
+    return match ? match[1] : null;
+  }
+
+  function extractMapaHorarioKey(name) {
+    const match = String(name || '').match(MAPA_HORARIO_RE);
+    return match ? match[1] : null;
+  }
+
+  function extractEspecificaDiaKey(name) {
+    const match = String(name || '').match(ESPECIFICA_DIA_RE);
+    return match ? match[1] : null;
+  }
+
+  function extractEspecificaHorarioKey(name) {
+    const match = String(name || '').match(ESPECIFICA_HORARIO_RE);
+    return match ? match[1] : null;
+  }
+
+  function findBooleanHolder(checkbox) {
+    return checkbox.closest('li')
+      || checkbox.closest('.input')
+      || checkbox.closest('.boolean')
+      || checkbox.parentElement;
+  }
+
+  function findFieldHolder(field) {
+    if (!field) return null;
+
+    return field.closest('li')
+      || field.closest('.input')
+      || field.closest('.field')
+      || field.parentElement;
+  }
+
+  function findLabelForInput(input, holder) {
+    if (input && input.id) {
+      const escapedId = cssEscape(input.id);
+
+      const label = holder.querySelector(`label[for="${escapedId}"]`)
+        || document.querySelector(`label[for="${escapedId}"]`);
+
+      if (label) return label;
+    }
+
+    return holder.querySelector('label') || null;
+  }
+
+  function cssEscape(value) {
+    if (typeof CSS !== 'undefined' && CSS.escape) {
+      return CSS.escape(value);
+    }
+
+    return String(value).replace(/([#.;?+*~':"!^$[\]()=>|/@])/g, '\\$1');
+  }
+
+  function isVisible(el) {
+    if (!el) return false;
+
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none'
+      && style.visibility !== 'hidden'
+      && style.opacity !== '0';
+  }
+
+  function isMarkedForDestroy(el) {
+    if (!el || !el.name) return false;
+
+    const prefixes = getPossibleDestroyPrefixes(el.name);
+
+    return prefixes.some((prefix) => {
+      const allFields = getAllNamedFields();
+
+      const destroyCheckbox = allFields.find((field) => {
+        return field.name === `${prefix}[_destroy]`
+          && field.matches('input[type="checkbox"]');
+      });
+
+      if (destroyCheckbox) return destroyCheckbox.checked;
+
+      const destroyInput = allFields.find((field) => field.name === `${prefix}[_destroy]`);
+      if (!destroyInput) return false;
+
+      return destroyInput.value === '1' || destroyInput.value === 'true';
+    });
+  }
+
+  function getPossibleDestroyPrefixes(name) {
+    const prefixes = [];
+
+    const mapaPeriodoKey = extractMapaPeriodoKey(name);
+    const mapaPeriodoValidoKey = extractMapaPeriodoValidoKey(name);
+    const mapaDiaKey = extractMapaDiaKey(name);
+    const mapaHorarioKey = extractMapaHorarioKey(name);
+
+    if (mapaPeriodoKey) {
+      const periodPrefix = `agenda[agendas_mapas_periodos_attributes][${mapaPeriodoKey}]`;
+      prefixes.push(...buildMapaDestroyPrefixes(periodPrefix, mapaDiaKey, mapaHorarioKey));
+    }
+
+    if (mapaPeriodoValidoKey) {
+      const periodPrefix = `agenda[agendas_mapas_periodos_validos_attributes][${mapaPeriodoValidoKey}]`;
+      prefixes.push(...buildMapaDestroyPrefixes(periodPrefix, mapaDiaKey, mapaHorarioKey));
+    }
+
+    const especificaDiaKey = extractEspecificaDiaKey(name);
+    const especificaHorarioKey = extractEspecificaHorarioKey(name);
+
+    if (especificaDiaKey) {
+      const especificaDiaPrefix = `agenda[agendas_especificas_dias_attributes][${especificaDiaKey}]`;
+      prefixes.push(especificaDiaPrefix);
+
+      if (especificaHorarioKey) {
+        prefixes.push(`${especificaDiaPrefix}[agendas_especificas_horarios_attributes][${especificaHorarioKey}]`);
+      }
+    }
+
+    return prefixes;
+  }
+
+  function buildMapaDestroyPrefixes(periodPrefix, mapaDiaKey, mapaHorarioKey) {
+    const prefixes = [periodPrefix];
+
+    if (mapaDiaKey) {
+      const dayPrefix = `${periodPrefix}[agendas_mapas_dias_attributes][${mapaDiaKey}]`;
+      prefixes.push(dayPrefix);
+
+      if (mapaHorarioKey) {
+        prefixes.push(`${dayPrefix}[agendas_mapas_horarios_attributes][${mapaHorarioKey}]`);
+      }
+    }
+
+    return prefixes;
+  }
+
+  function groupBy(items, getKey) {
+    const map = new Map();
+
+    items.forEach((item) => {
+      const key = getKey(item);
+
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(item);
+    });
+
+    return map;
+  }
+
+  function debounce(fn, wait) {
+    let timer = null;
+
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function injectStyles() {
+    if (document.getElementById('ss-agenda-preview-style')) return;
+
+    const style = document.createElement('style');
+    style.id = 'ss-agenda-preview-style';
+    style.textContent = `
+      body.ss-agenda-preview-side-open {
+        padding-right: 500px !important;
+        transition: padding-right 120ms ease;
+      }
+
+      .ss-preview-horario-distribuido-host {
+        white-space: nowrap;
+      }
+
+      .ss-preview-horario-distribuido-label {
+        display: inline-flex !important;
+        align-items: center !important;
+        width: auto !important;
+        max-width: none !important;
+        margin-right: 8px !important;
+        vertical-align: middle !important;
+        white-space: nowrap !important;
+      }
+
+      .ss-preview-horario-distribuido-label input[type="checkbox"] {
+        margin-right: 5px !important;
+      }
+
+      .ss-preview-separacao-fixa {
+        display: inline-flex !important;
+        align-items: center !important;
+        margin-right: 8px !important;
+        vertical-align: middle !important;
+        white-space: nowrap !important;
+      }
+
+      .ss-agenda-preview-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-left: 8px;
+        padding: 5px 9px;
+        border: 1px solid #2563eb;
+        border-radius: 6px;
+        background: #2563eb;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.2;
+        cursor: pointer;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+
+      .ss-agenda-preview-btn:hover {
+        background: #1d4ed8;
+        border-color: #1d4ed8;
+      }
+
+      .ss-agenda-preview-btn-active {
+        background: #16a34a;
+        border-color: #16a34a;
+      }
+
+      .ss-agenda-preview-btn-active:hover {
+        background: #15803d;
+        border-color: #15803d;
+      }
+
+      #ss-agenda-preview-side-panel {
+        position: fixed;
+        z-index: 999998;
+        top: 0;
+        right: 0;
+        width: 480px;
+        max-width: calc(100vw - 32px);
+        height: 100vh;
+        background: #fff;
+        color: #111827;
+        border-left: 1px solid #cbd5e1;
+        box-shadow: -12px 0 36px rgba(15, 23, 42, 0.24);
+        font-family: Arial, Helvetica, sans-serif;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .ss-side-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-bottom: 1px solid #e5e7eb;
+        background: #f8fafc;
+      }
+
+      .ss-side-header h2 {
+        margin: 0 0 5px;
+        font-size: 18px;
+        line-height: 1.2;
+      }
+
+      .ss-side-close {
+        width: 32px;
+        height: 32px;
+        border: 0;
+        border-radius: 999px;
+        background: #e5e7eb;
+        color: #111827;
+        font-size: 23px;
+        line-height: 1;
+        cursor: pointer;
+        flex: 0 0 auto;
+      }
+
+      .ss-side-close:hover {
+        background: #cbd5e1;
+      }
+
+      .ss-side-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+        padding: 12px 16px;
+        border-bottom: 1px solid #e5e7eb;
+      }
+
+      .ss-side-controls label {
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .ss-tipo-vaga-radio-group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+        font-size: 13px;
+        font-weight: 700;
+        color: #334155;
+      }
+
+      .ss-tipo-vaga-radio {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        cursor: pointer;
+        padding: 3px 4px;
+        border-radius: 6px;
+      }
+
+      .ss-tipo-vaga-radio input {
+        margin: 0;
+      }
+
+      .ss-tipo-vaga-radio-active {
+        background: #eff6ff;
+        color: #1d4ed8;
+      }
+
+      .ss-tipo-vaga-separator {
+        color: #94a3b8;
+        font-weight: 800;
+      }
+
+      .ss-side-action-btn-active {
+        background: #2563eb;
+        border-color: #2563eb;
+        color: #fff;
+      }
+
+      .ss-side-action-btn-active:hover {
+        background: #1d4ed8;
+      }
+
+
+      .ss-side-controls select,
+      .ss-preview-controls select {
+        margin-left: 6px;
+        min-width: 160px;
+        padding: 5px 7px;
+      }
+
+      .ss-side-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .ss-side-action-btn,
+      .ss-preview-refresh {
+        padding: 6px 9px;
+        border: 1px solid #64748b;
+        border-radius: 6px;
+        background: #fff;
+        color: #334155;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .ss-side-action-btn:hover,
+      .ss-preview-refresh:hover {
+        background: #f1f5f9;
+      }
+
+      .ss-live-status {
+        padding: 8px 16px;
+        background: #ecfdf5;
+        color: #166534;
+        border-bottom: 1px solid #bbf7d0;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .ss-vagas-calculator {
+        border-bottom: 1px solid #e5e7eb;
+        background: #f8fafc;
+        padding: 12px 16px;
+      }
+
+      .ss-vagas-calculator-header {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        margin-bottom: 9px;
+      }
+
+      .ss-vagas-calculator-header strong {
+        font-size: 13px;
+        color: #0f172a;
+      }
+
+      .ss-vagas-calculator-header span {
+        font-size: 11px;
+        color: #64748b;
+        line-height: 1.35;
+      }
+
+      .ss-vagas-calculator-controls {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+
+      .ss-vagas-calculator-controls label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #334155;
+      }
+
+      .ss-vagas-calculator-input {
+        width: 70px;
+        padding: 5px 7px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+
+      .ss-vagas-calculator-quick {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .ss-vagas-calculator-chip {
+        border: 1px solid #cbd5e1;
+        background: #fff;
+        color: #334155;
+        border-radius: 999px;
+        padding: 4px 8px;
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+
+      .ss-vagas-calculator-chip:hover {
+        background: #f1f5f9;
+      }
+
+      .ss-vagas-calculator-chip-active {
+        background: #2563eb;
+        border-color: #2563eb;
+        color: #fff;
+      }
+
+      .ss-vagas-calculator-result {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        max-height: 230px;
+        overflow: auto;
+        padding-right: 2px;
+      }
+
+      .ss-vagas-calculator-empty {
+        padding: 10px;
+        border: 1px dashed #cbd5e1;
+        border-radius: 8px;
+        background: #fff;
+        color: #64748b;
+        font-size: 12px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      .ss-vagas-calculator-card {
+        border: 1px solid #e2e8f0;
+        border-radius: 9px;
+        background: #fff;
+        padding: 9px;
+      }
+
+      .ss-vagas-calculator-ok {
+        border-color: #bbf7d0;
+        background: #f0fdf4;
+      }
+
+      .ss-vagas-calculator-alert {
+        border-color: #fed7aa;
+        background: #fff7ed;
+      }
+
+      .ss-vagas-calculator-card-title {
+        font-size: 12px;
+        font-weight: 800;
+        color: #0f172a;
+        margin-bottom: 3px;
+      }
+
+      .ss-vagas-calculator-card-meta {
+        font-size: 11px;
+        color: #64748b;
+        margin-bottom: 7px;
+      }
+
+      .ss-vagas-calculator-card-line {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 5px;
+        font-size: 11px;
+        color: #334155;
+        margin-bottom: 7px;
+      }
+
+      .ss-vagas-calculator-card-detail {
+        font-size: 11px;
+        font-weight: 700;
+        color: #7c2d12;
+        margin-bottom: 5px;
+      }
+
+      .ss-vagas-calculator-ok .ss-vagas-calculator-card-detail {
+        color: #166534;
+      }
+
+      .ss-vagas-calculator-card-distribution {
+        font-size: 10px;
+        color: #64748b;
+        line-height: 1.35;
+      }
+
+
+      .ss-side-body {
+        overflow: auto;
+        padding: 14px 16px 20px;
+      }
+
+      .ss-preview-subtitle {
+        font-size: 12px;
+        color: #475569;
+        line-height: 1.35;
+      }
+
+      .ss-preview-summary {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+
+      .ss-preview-summary-compact {
+        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      }
+
+      .ss-summary-card {
+        padding: 10px;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #f8fafc;
+      }
+
+      .ss-summary-card small {
+        display: block;
+        margin-bottom: 4px;
+        color: #64748b;
+        font-size: 10px;
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+
+      .ss-summary-card strong {
+        display: block;
+        font-size: 18px;
+        color: #0f172a;
+      }
+
+      .ss-summary-warn {
+        border-color: #f59e0b;
+        background: #fffbeb;
+      }
+
+      .ss-validation-warnings {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-bottom: 14px;
+      }
+
+      .ss-validation-warning-card {
+        border: 1px solid #dc2626;
+        background: #fef2f2;
+        color: #991b1b;
+        border-radius: 10px;
+        padding: 10px;
+      }
+
+      .ss-validation-warning-card strong {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 4px;
+      }
+
+      .ss-validation-warning-card span {
+        display: block;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .ss-preview-day-section {
+        margin: 0 0 14px;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        overflow: hidden;
+      }
+
+      .ss-preview-day-section h3 {
+        margin: 0;
+        padding: 9px 11px;
+        background: #eff6ff;
+        color: #1e3a8a;
+        border-bottom: 1px solid #dbeafe;
+        font-size: 14px;
+      }
+
+      .ss-preview-line {
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr);
+        gap: 8px;
+        align-items: start;
+        padding: 8px 11px;
+        border-bottom: 1px solid #f1f5f9;
+      }
+
+      .ss-preview-line:last-child {
+        border-bottom: 0;
+      }
+
+      .ss-preview-line-zero {
+        background: #fffbeb;
+      }
+
+      .ss-preview-line-zero .ss-preview-time,
+      .ss-preview-line-zero .ss-preview-text {
+        color: #92400e;
+      }
+
+      .ss-preview-time {
+        font-variant-numeric: tabular-nums;
+        font-weight: 800;
+        color: #0f172a;
+      }
+
+      .ss-preview-text {
+        color: #111827;
+        min-width: 0;
+        word-break: break-word;
+      }
+
+      .ss-preview-source {
+        grid-column: 2;
+        color: #64748b;
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .ss-preview-warning {
+        margin: 9px 11px;
+        padding: 9px;
+        border: 1px solid #f59e0b;
+        border-radius: 8px;
+        background: #fffbeb;
+        color: #92400e;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .ss-preview-warning-zero {
+        margin-top: -4px;
+      }
+
+      .ss-preview-empty {
+        padding: 16px;
+        border: 1px dashed #cbd5e1;
+        border-radius: 10px;
+        background: #f8fafc;
+        color: #475569;
+        text-align: center;
+        font-weight: 700;
+      }
+
+      #ss-agenda-preview-overlay {
+        position: fixed;
+        z-index: 999999;
+        inset: 0;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding: 32px 16px;
+        background: rgba(15, 23, 42, 0.62);
+        overflow: auto;
+      }
+
+      #ss-agenda-preview-modal {
+        width: min(980px, calc(100vw - 32px));
+        max-height: calc(100vh - 64px);
+        overflow: auto;
+        background: #fff;
+        color: #111827;
+        border-radius: 12px;
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      #ss-agenda-preview-modal .ss-preview-summary {
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      }
+
+      #ss-agenda-preview-modal .ss-preview-line {
+        grid-template-columns: 72px 1fr 110px;
+      }
+
+      #ss-agenda-preview-modal .ss-preview-source {
+        grid-column: auto;
+        text-align: right;
+      }
+
+      .ss-preview-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 18px 22px;
+        border-bottom: 1px solid #e5e7eb;
+        background: #f8fafc;
+        position: sticky;
+        top: 0;
+        z-index: 2;
+      }
+
+      .ss-preview-header h2 {
+        margin: 0 0 6px;
+        font-size: 20px;
+        line-height: 1.2;
+      }
+
+      .ss-preview-close {
+        width: 34px;
+        height: 34px;
+        border: 0;
+        border-radius: 999px;
+        background: #e5e7eb;
+        color: #111827;
+        font-size: 24px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      .ss-preview-close:hover {
+        background: #cbd5e1;
+      }
+
+      .ss-preview-controls {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 14px 22px;
+        border-bottom: 1px solid #e5e7eb;
+      }
+
+      .ss-preview-controls label {
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .ss-preview-body {
+        padding: 18px 22px 24px;
+      }
+
+      @media (max-width: 1100px) {
+        body.ss-agenda-preview-side-open {
+          padding-right: 0 !important;
+        }
+
+        #ss-agenda-preview-side-panel {
+          width: 440px;
+          max-width: 94vw;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+})();
