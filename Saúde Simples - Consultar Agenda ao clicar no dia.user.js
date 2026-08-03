@@ -2,6 +2,8 @@
 // @name         Saúde Simples - Consultar Agenda ao clicar no dia
 // @namespace    om30.saudesimples.guaruja
 // @version      1.1.0
+// @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Consultar%20Agenda%20ao%20clicar%20no%20dia.user.js
+// @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Consultar%20Agenda%20ao%20clicar%20no%20dia.user.js
 // @description  Ao selecionar uma data no agendamento, consulta /consultar_agendas (mesma data, unidade e profissional) e exibe os agendamentos em painel inline dentro da agenda clicada. Suporta múltiplas agendas por profissional.
 // @match        https://guaruja.saudesimples.net/agendamentos*
 // @run-at       document-start
