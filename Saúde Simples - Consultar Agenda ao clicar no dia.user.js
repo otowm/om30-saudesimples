@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Saúde Simples - Consultar Agenda ao clicar no dia
 // @namespace    om30.saudesimples.guaruja
-// @version      1.1.0
+// @version      1.2.0
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Consultar%20Agenda%20ao%20clicar%20no%20dia.user.js
 // @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Consultar%20Agenda%20ao%20clicar%20no%20dia.user.js
 // @description  Ao selecionar uma data no agendamento, consulta /consultar_agendas (mesma data, unidade e profissional) e exibe os agendamentos em painel inline dentro da agenda clicada. Suporta múltiplas agendas por profissional.
 // @match        https://guaruja.saudesimples.net/agendamentos*
+// @match        https://guarujahomolog.saudesimples.net/agendamentos*
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -22,9 +23,13 @@
     alturaMax: 280,      // altura máxima (px) da lista antes de rolar
   };
 
-  /* ============ Mapa nome -> id das unidades (select do filtro) ============ */
+  /* ============ Mapas nome -> id das unidades por ambiente ============ */
 
-  const UNIDADES = {
+  const AMBIENTE = location.hostname === 'guarujahomolog.saudesimples.net'
+    ? 'HOMOLOGAÇÃO'
+    : 'PRODUÇÃO';
+
+  const UNIDADES_PRODUCAO = {
     'AMB REF EM ESPECIALIDADES E SAUDE DA MULHER ARE GUARUJA': 70,
     'AMBULATORIO TRANSEXUALIZADOR TRANSFORMA GUARUJA': 121,
     'CAF CENTRAL DE ABASTECIMENTO FARMACEUTICO': 106,
@@ -92,6 +97,75 @@
     'USAFA VILA ZILDA DR DAVID CAPISTRANO DA COSTA FILHO GUARUJA': 100,
   };
 
+  const UNIDADES_HOMOLOGACAO = {
+    'ALMOXARIFADO CENTRAL DA SAUDE': 122,
+    'ALMOXARIFADO FARMACEUTICO 1': 123,
+    'AMBULATORIO DE ESPECIALIDADES DA MULHER': 70,
+    'CAPS AD II': 68,
+    'CAPS ADULTO I': 71,
+    'CAPS III': 72,
+    'CAPS INFANTIL': 73,
+    'CENTRAL DE ABASTECIMENTO FARMACEUTICO': 106,
+    'CENTRAL DE REGULACAO MUNICIPAL': 118,
+    'CENTRO DE ATENCAO PSICOSSOCIAL TRAUMA': 66,
+    'CENTRO DE ESPECIALIDADES': 119,
+    'CENTRO DE REABILITACAO': 76,
+    'CENTRO DE REABILITACAO E CER': 116,
+    'CENTRO DE REABILITACAO E FISIOTERAPIA': 75,
+    'CENTRO DE REFERENCIA EM OTORRINO E OFTALMO': 77,
+    'CENTRO ODONTOLOGICO CEO': 74,
+    'CONSULTORIO NA RUA': 78,
+    'FARMACIA DO CIDADAO I': 80,
+    'FARMACIA DO CIDADAO II': 81,
+    'FARMACIA DO CIDADAO III': 79,
+    'INSTITUTO DA MULHER': 57,
+    'PRONTO SOCORRO CENTRAL': 59,
+    'PRONTO SOCORRO PEREQUE': 82,
+    'PRONTO SOCORRO REGIONAL': 101,
+    'PRONTO SOCORRO SANTA CRUZ': 83,
+    'SAMU 192 SAV 836': 109,
+    'SAMU 192 SBV 721': 113,
+    'SAMU 192 SBV 799': 114,
+    'SAMU 192 SBV 821': 107,
+    'SAMU 192 SBV 833': 108,
+    'SAMU 192 SBV 834': 111,
+    'SAMU 192 SBV 837': 112,
+    'SAMU MOTOLANCIA M1 145': 110,
+    'SECRETARIA MUNICIPAL DE SAUDE': 48,
+    'SERVICO DE INTERNACAO DOMICILIAR': 84,
+    'SERVICO DE TRANSPORTE SANITARIO': 69,
+    'SERVICO DE VIGILANCIA SANITARIA E EPIDEMIOLOGICA': 105,
+    'UBS MIRANTE DA MATA': 124,
+    'UBS MORRINHOS': 60,
+    'UBS PAE CARA': 85,
+    'UBS PERNAMBUCO': 61,
+    'UBS PRAINHA': 62,
+    'UBS VILA ALICE': 102,
+    'UBS VILA BAIANA': 103,
+    'UBS VILA COSMOPOLITA': 125,
+    'UNIDADE COMPLEXA I': 65,
+    'UNIDADE DE ESPECIALIDADE EM DIABETES': 86,
+    'UNIDADE DE SAUDE SANTA ROSA': 58,
+    'UNIDADE DE VIGILANCIA EM ZOONOSES': 104,
+    'UNIDADE OPERACIONAL 30': 121,
+    'UNIDADE UNIVERSITARIA': 120,
+    'UPA ENSEADA': 67,
+    'USAFA CIDADE ATLANTICA': 87,
+    'USAFA JARDIM BOA ESPERANCA': 88,
+    'USAFA JARDIM BRASIL': 89,
+    'USAFA JARDIM CONCEICAOZINHA': 90,
+    'USAFA JARDIM DOS PASSAROS': 91,
+    'USAFA JARDIM LAS PALMAS': 92,
+    'USAFA JARDIM PROGRESSO': 93,
+    'USAFA PEREQUE': 94,
+    'USAFA SANTA CRUZ': 95,
+    'USAFA SITIO CONCEICAOZINHA': 96,
+    'USAFA VILA AUREA': 97,
+    'USAFA VILA EDNA': 98,
+    'USAFA VILA RA': 99,
+    'USAFA VILA ZILDA': 100,
+  };
+
   const normalizar = (s) =>
     (s || '')
       .normalize('NFD')
@@ -100,8 +174,12 @@
       .trim()
       .toUpperCase();
 
+  const UNIDADES_ATUAIS = AMBIENTE === 'HOMOLOGAÇÃO'
+    ? UNIDADES_HOMOLOGACAO
+    : UNIDADES_PRODUCAO;
+
   const UNIDADES_NORM = new Map(
-    Object.entries(UNIDADES).map(([nome, id]) => [normalizar(nome), id])
+    Object.entries(UNIDADES_ATUAIS).map(([nome, id]) => [normalizar(nome), id])
   );
 
   /* ======================= Coleta de dados da página ======================= */
@@ -110,15 +188,45 @@
     const el = document.querySelector(
       '#site-navbar-collapse ul li.nav-item.unidade-saude-atual a'
     );
-    if (!el) return '';
-    const id = UNIDADES_NORM.get(normalizar(el.textContent));
-    if (!id) console.warn('[ConsultaAgenda] Unidade não mapeada:', el.textContent.trim());
-    return id || '';
+
+    if (!el) {
+      console.warn('[ConsultaAgenda] Unidade atual não encontrada no navbar.');
+      return '';
+    }
+
+    const nome = el.textContent.trim();
+    const id = UNIDADES_NORM.get(normalizar(nome));
+
+    if (!id) {
+      console.warn(
+        `[ConsultaAgenda] Unidade não mapeada em ${AMBIENTE}:`,
+        nome
+      );
+      return '';
+    }
+
+    console.log(`[ConsultaAgenda] ${AMBIENTE} | Unidade: ${nome} | ID: ${id}`);
+    return String(id);
   }
 
   function getProfissionalId() {
-    const opt = document.querySelector('#agendamento_profissional_id > option:nth-child(2)');
-    return opt ? (opt.value || '').trim() : '';
+    const select = document.querySelector('#agendamento_profissional_id');
+
+    if (!select) {
+      console.warn('[ConsultaAgenda] Select de profissional não encontrado.');
+      return '';
+    }
+
+    const id = (select.value || '').trim();
+    const nome = select.selectedOptions?.[0]?.textContent?.trim() || '';
+
+    if (!id) {
+      console.warn('[ConsultaAgenda] Nenhum profissional está selecionado.');
+      return '';
+    }
+
+    console.log(`[ConsultaAgenda] Profissional: ${nome} | ID: ${id}`);
+    return id;
   }
 
   // Localiza a div.agenda correspondente ao agenda_id (via div.calendar_XXXX)
@@ -428,5 +536,5 @@
     return origFetch.apply(this, arguments);
   };
 
-  console.log('[ConsultaAgenda] v1.1.0 ativo — aguardando seleção de data no agendamento.');
+  console.log(`[ConsultaAgenda] v1.2.0 ativo em ${AMBIENTE} — aguardando seleção de data no agendamento.`);
 })();
