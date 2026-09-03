@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.6.1
+// @version      1.10.0
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma e quantas estão livres.
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/agendamentos*
@@ -896,6 +896,7 @@
       .ssvh-parcial{ background: #fff4e5; color: #8a5300; border: 1px solid #f0d0a0; }
       .ssvh-neutro { background: #eee; color: #555; border: 1px solid #ddd; }
       .ssvh-det { color: #888; font-weight: normal; }
+      .ssvh-obs-vazia { color: #bbb; }
       .ssvh-toggle { cursor: pointer; user-select: none; color: #06c; }
       .ssvh-toggle input { vertical-align: middle; margin: 0 4px 0 0; }
       .ssvh-linha-cheia { display: none; opacity: .75; }
@@ -924,6 +925,30 @@
       }
       .ssvh-pop-corpo { overflow: auto; }
       .ssvh-pop-sub { padding: 6px 10px 0; color: #666; }
+      .ssvh-painel {
+        position: fixed; inset: 0; z-index: 999999; background: rgba(0,0,0,.35);
+        display: flex; align-items: center; justify-content: center; padding: 20px;
+      }
+      .ssvh-painel-caixa {
+        background: #fff; border-radius: 6px; box-shadow: 0 10px 40px rgba(0,0,0,.3);
+        font: 12px/1.45 Arial, sans-serif; color: #333;
+        max-width: 1000px; width: 100%; max-height: 85vh;
+        display: flex; flex-direction: column; overflow: hidden;
+      }
+      .ssvh-painel .ssvh-pop-corpo { overflow: auto; }
+      .ssvh-painel table { width: 100%; border-collapse: collapse; }
+      .ssvh-painel th, .ssvh-painel td {
+        padding: 6px 10px; border-bottom: 1px solid #eee; text-align: left; vertical-align: top;
+      }
+      .ssvh-painel th { position: sticky; top: 0; background: #efefef; font-size: 11px; }
+      .ssvh-painel tfoot td { background: #f7f7f7; border-top: 2px solid #ddd; }
+      .ssvh-painel .ssvh-hora { white-space: nowrap; font-weight: bold; }
+      .ssvh-painel .ssvh-nomes { width: 45%; }
+      .ssvh-painel .ssvh-chip { margin-left: 0; }
+      .ssvh-vazio { color: #bbb; }
+      .ssvh-painel-rodape {
+        padding: 6px 10px; background: #fafafa; border-top: 1px solid #eee; color: #666;
+      }
       .ssvh-pop-vazio { padding: 12px; text-align: center; color: #888; }
       .ssvh-pop table { width: 100%; border-collapse: collapse; }
       .ssvh-pop th, .ssvh-pop td {
@@ -1065,6 +1090,70 @@
       return chip;
     };
 
+    // O painel de horários é um grid_3 (~140px) do grid de 960, então a tabela
+    // não tem para onde crescer. Alargamos o painel para ocupar o que sobra ao
+    // lado do calendário.
+    if (tabela) {
+      const painel = tabela.closest('[class*="horario_"]');
+      if (painel && !painel.dataset.ssvhLargura) {
+        const calendario = painel.parentElement
+          && painel.parentElement.querySelector('[class*="calendario"], [class*="calendar_"]');
+        const mCal = calendario && calendario.className.match(/grid_(\d+)/);
+        const colunasCalendario = mCal ? Number(mCal[1]) : 5;
+        const largura = Math.max(16 - colunasCalendario - 1, 6);
+        if (/grid_\d+/.test(painel.className)) {
+          painel.className = painel.className.replace(/grid_\d+/, `grid_${largura}`);
+        } else {
+          painel.style.width = '100%';
+        }
+        painel.dataset.ssvhLargura = '1';
+      }
+    }
+
+    // Sem observação a tabela vem com 2 colunas e fica espremida num canto.
+    // Injetamos a coluna de observação (com "—") para ela ocupar a largura
+    // toda, igual às agendas que têm observação.
+    if (tabela && !tabela.dataset.ssvhColunaObs) {
+      const linhasTabela = [...tabela.querySelectorAll('tr')];
+      const semObservacao = linhasTabela.length
+        && linhasTabela.every((tr) => tr.children.length === 2);
+      if (semObservacao) {
+        const grupo = tabela.querySelector('colgroup');
+        if (grupo) {
+          const cols = grupo.querySelectorAll('col');
+          if (cols[0]) cols[0].setAttribute('width', '60');
+          const novaCol = document.createElement('col');
+          novaCol.setAttribute('width', '*');
+          grupo.insertBefore(novaCol, cols[cols.length - 1]);
+        }
+        linhasTabela.forEach((tr) => {
+          const ehCabecalho = !!tr.querySelector('th');
+          const celula = document.createElement(ehCabecalho ? 'th' : 'td');
+          celula.textContent = ehCabecalho ? 'Observação' : '—';
+          if (!ehCabecalho) celula.className = 'ssvh-obs-vazia';
+          tr.insertBefore(celula, tr.children[1]);
+        });
+        tabela.style.width = '100%';
+        tabela.dataset.ssvhColunaObs = '1';
+      }
+    }
+
+    // A tabela pode vir com 3 colunas (hora, observação, ação) ou com 2 (hora,
+    // ação), quando não há observação. O chip vai na última coluna que não é a
+    // do botão, para não ficar espremido embaixo dele.
+    const indiceDaCelula = (tr) => {
+      const tds = [...tr.querySelectorAll('td')];
+      if (!tds.length) return -1;
+      const ultimaLivre = tds.map((td, i) => ({ td, i }))
+        .filter(({ td }) => !td.querySelector('input, button, a'))
+        .pop();
+      return ultimaLivre ? ultimaLivre.i : 0;
+    };
+
+    let colunaChip = 0;
+    const modeloLinha = [...linhasPorHora.values()][0];
+    if (modeloLinha && modeloLinha[0]) colunaChip = Math.max(indiceDaCelula(modeloLinha[0]), 0);
+
     // --- chip em cada linha existente ---
     linhasPorHora.forEach((trs, hora) => {
       const v = porHora.get(hora);
@@ -1072,7 +1161,7 @@
         tr.querySelectorAll('.ssvh-chip').forEach((c) => c.remove());
         if (i > 0) return; // marca só a primeira linha do horário
         const tds = tr.querySelectorAll('td');
-        const celula = tds[1] || tds[0];
+        const celula = tds[colunaChip] || tds[0];
         if (celula) celula.appendChild(montarChip(hora, v));
       });
     });
@@ -1085,21 +1174,25 @@
 
     if (tabela) {
       tabela.querySelectorAll('.ssvh-linha-cheia').forEach((tr) => tr.remove());
-      const modelo = [...linhasPorHora.values()][0];
-      const colunas = modelo && modelo[0] ? modelo[0].querySelectorAll('td').length : 3;
+      const colunas = modeloLinha && modeloLinha[0]
+        ? modeloLinha[0].querySelectorAll('td').length : 3;
 
       cheios.forEach((hora) => {
         const v = porHora.get(hora);
         const tr = document.createElement('tr');
         tr.className = 'ssvh-linha-cheia';
-        const tdHora = document.createElement('td');
-        tdHora.textContent = hora;
-        const tdInfo = document.createElement('td');
-        if (v.cfg && v.cfg.observacoes.size) tdInfo.textContent = [...v.cfg.observacoes].join(' / ');
-        tdInfo.appendChild(montarChip(hora, v));
-        tr.appendChild(tdHora);
-        tr.appendChild(tdInfo);
-        for (let k = 2; k < colunas; k += 1) tr.appendChild(document.createElement('td'));
+        const celulas = [];
+        for (let k = 0; k < colunas; k += 1) {
+          const td = document.createElement('td');
+          tr.appendChild(td);
+          celulas.push(td);
+        }
+        celulas[0].textContent = hora;
+        const alvoChip = celulas[colunaChip] || celulas[0];
+        if (colunaChip !== 0 && v.cfg && v.cfg.observacoes.size) {
+          alvoChip.textContent = [...v.cfg.observacoes].join(' / ');
+        }
+        alvoChip.appendChild(montarChip(hora, v));
 
         // insere na ordem cronológica entre as linhas já existentes
         const seguinte = [...tabela.querySelectorAll('tr')]
@@ -1123,6 +1216,7 @@
     box.innerHTML = `
       <b>${esc(TIPOS[tipoChave].label)} em ${esc(dataStr)}</b>
       <span class="ssvh-det">· ${totalLivre} de ${totalConfigTipo} livre(s)</span>
+      · <a href="#" class="ssvh-ver-agenda">ver agenda do dia</a>
       <br>
       ${esc(config.profissional)} — ${esc(config.procedimento)}
       · <a href="/agendas/${esc(agendaId)}" target="_blank" rel="noopener">ver configuração ↗</a>
@@ -1133,6 +1227,17 @@
       ${avisos.length ? `<br><span class="ssvh-alerta">${esc(avisos.join(' · '))}</span>` : ''}
     `;
 
+    const linkAgenda = box.querySelector('.ssvh-ver-agenda');
+    if (linkAgenda) {
+      linkAgenda.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        abrirAgendaDoDia({
+          agendaId, dataStr, config, configuradas,
+          detalhesPorHora, temTipoVaga,
+        });
+      });
+    }
+
     const marcador = box.querySelector('.ssvh-toggle input');
     if (marcador) {
       marcador.addEventListener('change', () => {
@@ -1142,6 +1247,115 @@
 
     if (tabela && tabela.parentElement === destino) destino.insertBefore(box, tabela);
     else destino.appendChild(box);
+  }
+
+  /* =========================== Agenda completa do dia =========================== */
+
+  let painelAtual = null;
+
+  function fecharPainel() {
+    if (!painelAtual) return;
+    painelAtual.remove();
+    painelAtual = null;
+    document.removeEventListener('keydown', aoTeclarPainel, true);
+  }
+
+  function aoTeclarPainel(ev) {
+    if (ev.key === 'Escape') fecharPainel();
+  }
+
+  /**
+   * Mostra a agenda inteira daquela data: todos os horários e todos os tipos de
+   * vaga do procedimento selecionado, independente do tipo que está sendo
+   * pesquisado na tela.
+   */
+  function abrirAgendaDoDia({ agendaId, dataStr, config, configuradas, detalhesPorHora, temTipoVaga }) {
+    fecharPainel();
+    injetarCss();
+
+    const horas = [...new Set([...configuradas.keys(), ...detalhesPorHora.keys()])].sort();
+    const tipos = ORDEM_DISTRIBUIDO.filter((t) => {
+      const temConfig = [...configuradas.values()].some((v) => (v.porTipo[t] || 0) > 0);
+      const temOcup = temTipoVaga && [...detalhesPorHora.values()]
+        .some((lista) => lista.some((o) => tipoDaOcupacao(o) === t));
+      return temConfig || temOcup;
+    });
+
+    const somas = {};
+    tipos.forEach((t) => { somas[t] = { total: 0, ocup: 0 }; });
+
+    const linhas = horas.map((hora) => {
+      const cfg = configuradas.get(hora);
+      const agendados = detalhesPorHora.get(hora) || [];
+
+      const celulas = tipos.map((t) => {
+        const total = cfg ? (cfg.porTipo[t] || 0) : 0;
+        const ocup = temTipoVaga
+          ? agendados.filter((o) => tipoDaOcupacao(o) === t).length
+          : 0;
+        somas[t].total += total;
+        somas[t].ocup += ocup;
+        if (!total && !ocup) return '<td class="ssvh-vazio">—</td>';
+        const livres = Math.max(total - ocup, 0);
+        const classe = livres <= 0 ? 'ssvh-cheio' : (livres < total ? 'ssvh-parcial' : 'ssvh-livre');
+        return `<td><span class="ssvh-chip ${classe}">${livres}/${total}</span></td>`;
+      }).join('');
+
+      const nomes = agendados.length
+        ? agendados.map((o) => `${esc(o.paciente || '(sem nome)')}`
+            + (o.tipoVaga ? ` <span class="ssvh-det">(${esc(o.tipoVaga)})</span>` : '')
+            + (o.prontuario ? ` <span class="ssvh-det">· pront. ${esc(o.prontuario)}</span>` : ''))
+          .join('<br>')
+        : '<span class="ssvh-vazio">—</span>';
+
+      const obs = cfg && cfg.observacoes.size ? esc([...cfg.observacoes].join(' / ')) : '';
+
+      return `<tr>
+        <td class="ssvh-hora">${esc(hora)}${obs ? `<br><span class="ssvh-det">${obs}</span>` : ''}</td>
+        ${celulas}
+        <td class="ssvh-nomes">${nomes}</td>
+      </tr>`;
+    }).join('');
+
+    const rodape = tipos.map((t) => {
+      const { total, ocup } = somas[t];
+      return `<td><b>${Math.max(total - ocup, 0)}/${total}</b></td>`;
+    }).join('');
+
+    const pop = document.createElement('div');
+    pop.className = 'ssvh-painel';
+    pop.innerHTML = `
+      <div class="ssvh-painel-caixa">
+        <div class="ssvh-pop-head">
+          <b>Agenda de ${esc(dataStr)}</b>
+          <span class="ssvh-det">${esc(config.profissional)} — ${esc(config.procedimento)}</span>
+          <button class="ssvh-pop-fechar" title="Fechar">✕</button>
+        </div>
+        ${temTipoVaga ? '' : '<div class="ssvh-pop-nota">A listagem de atendimentos não separa o tipo de vaga, então as ocupadas não foram distribuídas entre os tipos: os números abaixo mostram apenas o que está configurado.</div>'}
+        <div class="ssvh-pop-corpo">
+          <table>
+            <thead>
+              <tr>
+                <th>Hora</th>
+                ${tipos.map((t) => `<th>${esc(TIPOS[t].label)}</th>`).join('')}
+                <th>Agendados</th>
+              </tr>
+            </thead>
+            <tbody>${linhas || '<tr><td colspan="9" class="ssvh-vazio">Nenhum horário configurado nesta data.</td></tr>'}</tbody>
+            ${linhas ? `<tfoot><tr><td><b>Total</b></td>${rodape}<td></td></tr></tfoot>` : ''}
+          </table>
+        </div>
+        <div class="ssvh-painel-rodape">
+          Livres/configuradas por tipo de vaga ·
+          <a href="/agendas/${esc(agendaId)}" target="_blank" rel="noopener">ver configuração ↗</a>
+        </div>
+      </div>`;
+
+    pop.addEventListener('click', (ev) => { if (ev.target === pop) fecharPainel(); });
+    pop.querySelector('.ssvh-pop-fechar').addEventListener('click', fecharPainel);
+    document.body.appendChild(pop);
+    painelAtual = pop;
+    document.addEventListener('keydown', aoTeclarPainel, true);
   }
 
   /* ============================ Popover de agendados ============================ */
@@ -1442,5 +1656,5 @@
     return origFetch.apply(this, arguments);
   };
 
-  console.log(`[Vagas] v1.6.1 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
+  console.log(`[Vagas] v1.10.0 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
 })();
