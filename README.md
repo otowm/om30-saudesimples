@@ -39,6 +39,12 @@ Atualiza o título da aba e o logo exibido no sistema.
 
 ---
 
+### 💉 [Vacinação (Aplicação)](https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20Vacina%C3%A7%C3%A3o%20(Aplica%C3%A7%C3%A3o).user.js)
+
+Facilita a ficha de aplicação de vacinas: profissional e local preenchidos, busca de vacina, painel com o histórico da carteirinha (clique numa dose para lançar) e bloqueio do Salvar sem CPF ou com dose já aplicada.
+
+---
+
 ## ⚙️ Como instalar
 
 1. Instale o Tampermonkey no seu navegador (links acima)
