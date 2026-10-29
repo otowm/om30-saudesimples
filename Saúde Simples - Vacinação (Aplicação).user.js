@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         💉 Saúde Simples — Vacinação (Aplicação)
 // @namespace    om30-guaruja
-// @version      0.2.0
+// @version      0.3.1
 // @description  Facilita o preenchimento da aplicação e verifica pendências antes de salvar.
-// @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Vacina%C3%A7%C3%A3o%20(Aplica%C3%A7%C3%A3o).user.js
-// @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/main/Sa%C3%BAde%20Simples%20-%20Vacina%C3%A7%C3%A3o%20(Aplica%C3%A7%C3%A3o).user.js
+// @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20Vacina%C3%A7%C3%A3o%20(Aplica%C3%A7%C3%A3o).user.js
+// @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20Vacina%C3%A7%C3%A3o%20(Aplica%C3%A7%C3%A3o).user.js
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/esus/vacinacoes*
 // @match        https://guarujahomolog.saudesimples.net/esus/vacinacoes*
@@ -16,6 +16,7 @@
 (function () {
     'use strict';
 
+    const LISTA_COM_MODAL = true; // vacinas incluídas viram lista; incluir/editar abre modal.
     const PROFISSIONAL_LOGADO = true; // Selecionar o profissional do usuário na nova ficha.
     const LOCAL_UBS = true; // Preencher UBS quando o local estiver vazio.
     const MATERNAL_SEM_PADRAO = true; // Exigir escolha maternal nas fichas novas.
@@ -23,6 +24,7 @@
     const ROTINA_FAIXA_ETARIA = true; // Sugerir Faixa Etária para a estratégia Rotina.
     const VIAS_DE_VACINA = true; // Mostrar primeiro as vias usadas em vacinação.
     const LOTE_FABRICANTE = true; // Lembrar o fabricante por imunobiológico e lote.
+    const FABRICANTE_DO_ESTOQUE = true; // Sem memória do lote, usar o fabricante do cadastro da vacina no estoque.
     const CPF_OBRIGATORIO = true; // Bloquear quando confirmado que o munícipe está sem CPF.
     const DOSE_DUPLICADA_NA_FICHA = true; // Avisar sobre vacina e dose repetidas nesta ficha.
     const HISTORICO_PAINEL = true; // Painel com as vacinas da carteirinha e as doses que o sistema oferece; clique lança a dose na ficha.
@@ -41,6 +43,8 @@
         const MATERNAL = 'input[type="radio"][name="esus_vacinacao[condicao_maternal]"]';
         const FABRICANTE = 'select.esus-vacinacao-fabricante-input';
         const CHAVE_MEMORIA = 'vac-lote-fabricante';
+        const CHAVE_ESTOQUE = 'vac-estoque-fabricante';
+        const estoqueFabricantes = new Map();
         const estados = new WeakMap();
         const dosesHistorico = new Map();
         const filaDoses = [];
@@ -48,6 +52,7 @@
         let lancandoDose = false;
         let usuario;
         let agendado = false;
+        let modalVacina;
 
         $('<style>', { id: 'vac-estilo', text: `
             .vac-aviso {clear:both; padding:12px; margin:10px 0; border:1px solid currentColor; border-radius:4px; font-size:14px; line-height:1.5}
@@ -92,6 +97,33 @@
             .vac-hist-estado, .vac-hist-subtitulo {padding:10px 16px}
             .vac-hist-erro {color:#b54708; background:#fffaeb}
             .vac-hist-painel [hidden] {display:none !important}
+            .vac-lista, .vac-lista *, .vac-item-modal {box-sizing:border-box}
+            .vac-lista {clear:both; background:#fff; border:1px solid #d0d5dd; border-radius:6px; margin:14px 0; padding-bottom:12px; font:13px/1.4 Roboto,sans-serif; color:#344054; overflow-x:auto}
+            .vac-lista-tabela {width:100%; border-collapse:collapse; margin-bottom:12px}
+            .vac-lista-tabela th {background:#f9fafb; font-weight:700; color:#344054; text-align:left}
+            .vac-lista-tabela th, .vac-lista-tabela td {padding:10px 12px}
+            .vac-lista-tabela td {border-top:1px solid #eaecf0}
+            .vac-lista-acoes {white-space:nowrap}
+            .vac-lista-acoes button + button {margin-left:6px}
+            .vac-lista .vac-cancelar {color:#b42318}
+            .vac-aplicar {margin-left:12px}
+            .vac-incompleta {display:inline-block; background:#fffaeb; color:#b54708; border:1px solid #f79009; border-radius:10px; font-size:11px; padding:1px 6px; margin-left:6px}
+            #item_container.vac-com-lista a.add_fields {display:none !important}
+            /* Fora da tela, mas com caixa de layout: os handlers do site usam select:visible nos itens. */
+            .vac-item-fechado, .vac-item-removido {position:absolute !important; left:-100000px !important; top:0 !important; width:980px !important; transform:none !important}
+            /* display:block vence o .hide() do Cocoon, que roda antes do after-remove do site (esse também usa select:visible). */
+            .vac-item-removido {display:block !important}
+            /* !important: o BlockUI do site põe position:relative inline no item enquanto carrega os campos. */
+            .vac-item-modal {position:fixed !important; top:4vh !important; left:50% !important; right:auto !important; bottom:auto !important; transform:translateX(-50%) !important; margin:0 !important; width:min(980px,94vw); max-height:92vh; overflow-y:auto; background:#fff; border-radius:8px; box-shadow:0 20px 50px rgba(16,24,40,.35); z-index:100050 !important; padding:0 20px 0 20px}
+            .vac-modal-fundo {position:fixed; inset:0; background:rgba(16,24,40,.5); z-index:100040}
+            .vac-modal-cabecalho {position:sticky; top:0; background:#fff; z-index:2; padding:14px 0; border-bottom:1px solid #eaecf0; display:flex; align-items:center; justify-content:space-between}
+            .vac-modal-cabecalho h2 {margin:0; font-size:18px; line-height:1.4}
+            .vac-modal-rodape {position:sticky; bottom:0; background:#fff; z-index:2; border-top:1px solid #eaecf0; padding:12px 0; display:flex; gap:8px; align-items:center; clear:both}
+            .vac-modal-falta {color:#b42318; margin-right:auto}
+            .vac-campo-falta {outline:2px solid #b42318; outline-offset:2px}
+            .vac-item-modal a.remove_fields {display:none !important}
+            .vac-item-modal .chosen-container {width:100% !important}
+            .vac-item-modal .chosen-container .chosen-drop {z-index:5}
             @media (max-width:650px) {.vac-hist-linha {flex-wrap:wrap; gap:8px} .vac-hist-vacina {width:100%; flex-basis:100%}}
         ` }).appendTo(document.head);
 
@@ -112,9 +144,207 @@
         function itensAtivos(form) {
             return Array.from(form.querySelectorAll('#item_container .nested-fields')).filter(item => {
                 const destruir = item.querySelector('input[id$="_destroy"]');
-                return !/^(1|true)$/i.test(destruir ? destruir.value : '') && $(item).is(':visible');
+                if (/^(1|true)$/i.test(destruir ? destruir.value : '') || item.classList.contains('vac-item-removido')) return false;
+                if (!LISTA_COM_MODAL) return $(item).is(':visible');
+                return !(item.style.display === 'none' && !item.matches('.vac-item-fechado, .vac-item-modal'));
             });
         }
+        function isolarItem(item, isolado) {
+            if (isolado) item.setAttribute('inert', '');
+            else item.removeAttribute('inert');
+            if (isolado) item.setAttribute('aria-hidden', 'true');
+            else item.removeAttribute('aria-hidden');
+        }
+        // O Cocoon esconde com display:none o item salvo removido (mantém _destroy=1); o select:visible do site quebraria.
+        function isolarRemovidos(form) {
+            form.querySelectorAll('#item_container .nested-fields').forEach(item => {
+                const destruir = item.querySelector('input[id$="_destroy"]');
+                if (!/^(1|true)$/i.test(destruir ? destruir.value : '')) return;
+                item.classList.add('vac-item-removido');
+                item.classList.remove('vac-item-fechado', 'vac-item-modal');
+                item.style.removeProperty('display');
+                isolarItem(item, true);
+            });
+        }
+        // Ignorar só o fechamento da lista; os containers ocultos pelo site continuam valendo.
+        function exibidoNoItem(el, item) {
+            for (let atual = el; atual && atual !== item; atual = atual.parentElement) {
+                if (atual.hidden || getComputedStyle(atual).display === 'none') return false;
+            }
+            return true;
+        }
+        function campoEmUso(campo, item) {
+            return !$(campo).is(':disabled') && !campo.hidden && exibidoNoItem(campo.parentElement, item) &&
+                (getComputedStyle(campo).display !== 'none' || campo.matches('select.chosen-select-full, select.chzn-select'));
+        }
+        function campoLote(item) {
+            return Array.from(item.querySelectorAll('.esus-vacinacao-lote-select, .esus-vacinacao-lote-sem-estoque-input, .esus-vacinacao-lote-manual-registro-anterior-input'))
+                .find(campo => campoEmUso(campo, item) && exibidoNoItem(campo, item));
+        }
+        function faltasItem(item) {
+            const faltas = [];
+            item.querySelectorAll('label').forEach(label => {
+                const abbr = label.querySelector('abbr');
+                if (!abbr || !exibidoNoItem(abbr, item)) return;
+                const container = label.closest('li') || label.parentElement;
+                const controles = Array.from(container.querySelectorAll('select, input:not([type="hidden"]), textarea'));
+                const associados = label.htmlFor ? controles.filter(c => c.id === label.htmlFor) : controles;
+                const campo = (associados.length ? associados : controles).find(c => campoEmUso(c, item));
+                if (!campo) return;
+                const vazio = campo.type === 'radio' ? !Array.from(item.querySelectorAll('input[type="radio"]'))
+                    .some(c => c.name === campo.name && c.checked && campoEmUso(c, item)) :
+                    campo.type === 'checkbox' ? !campo.checked : !String($(campo).val() || '').trim();
+                if (vazio) faltas.push({ container, texto: label.textContent.replace(/\*/g, '').trim() });
+            });
+            return faltas;
+        }
+        function textoCampo(campo) {
+            if (!campo || !campo.value) return '—';
+            const opcao = campo.options && campo.options[campo.selectedIndex];
+            return (opcao ? opcao.dataset.vacTexto || opcao.textContent : campo.value).trim() || '—';
+        }
+        function nomeVacina(item) {
+            return textoCampo(item.querySelector('select.tipo_imunobiologico')).replace(/^vacina\s+/i, '');
+        }
+        function agendarLista(form) {
+            const lista = estados.get(form)?.lista;
+            if (!lista) return;
+            clearTimeout(lista.timer);
+            lista.timer = setTimeout(() => renderizarLista(form), 80);
+        }
+        function renderizarLista(form, realcar) {
+            const lista = estados.get(form)?.lista;
+            if (!lista || !form.isConnected) return;
+            clearTimeout(lista.timer);
+            isolarRemovidos(form);
+            const itens = itensAtivos(form);
+            if (modalVacina?.form === form && !itens.includes(modalVacina.item)) { fecharVacina(); return; }
+            if (realcar) lista.realce = { item: realcar, ate: Date.now() + 2200 };
+            const corpo = lista.el.find('tbody').empty();
+            if (!itens.length) $('<td>', { colspan: 7, text: 'Nenhuma vacina incluída. Use “Aplicar vacina” ou clique numa dose do histórico.' }).appendTo($('<tr>').appendTo(corpo));
+            itens.forEach(item => {
+                item.classList.toggle('vac-item-fechado', item !== modalVacina?.item);
+                isolarItem(item, item !== modalVacina?.item);
+                const linha = $('<tr>').appendTo(corpo);
+                const vacina = $('<td>', { text: nomeVacina(item) }).appendTo(linha);
+                if (faltasItem(item).length) $('<span>', { class: 'vac-incompleta', text: 'incompleta' }).appendTo(vacina);
+                const fabricante = Array.from(item.querySelectorAll(FABRICANTE)).find(c => campoEmUso(c, item));
+                [textoCampo(item.querySelector('select[id*="tipo_dose_id"]')), textoCampo(item.querySelector('select.tipo_estrategia')),
+                    textoCampo(campoLote(item) || item.querySelector('.esus-vacinacao-lote-hidden')), textoCampo(fabricante),
+                    textoCampo(item.querySelector('select.via_administracao')) + ' / ' + textoCampo(item.querySelector('select.local_aplicacao'))]
+                    .forEach(texto => $('<td>', { text: texto }).appendTo(linha));
+                const acoes = $('<td>', { class: 'vac-lista-acoes' }).appendTo(linha);
+                $('<button>', { type: 'button', class: 'btn btn-mini btn-default', text: 'Editar' }).appendTo(acoes).on('click', () => abrirVacina(item));
+                $('<button>', { type: 'button', class: 'btn btn-mini btn-default vac-cancelar', text: 'Cancelar' }).appendTo(acoes).on('click', () => {
+                    if (confirm('Remover ' + nomeVacina(item) + ' desta ficha?')) {
+                        item.querySelector('a.remove_fields')?.click();
+                        agendarLista(form);
+                    }
+                });
+                if (item === realcar) destacar(linha[0]);
+                else if (item === lista.realce?.item && lista.realce.ate > Date.now()) {
+                    linha.addClass('vac-destaque');
+                    setTimeout(() => linha.removeClass('vac-destaque'), lista.realce.ate - Date.now());
+                }
+            });
+        }
+        async function criarItem(form) {
+            const antes = itensAtivos(form);
+            form.querySelector('#item_container a.add_fields')?.click();
+            const item = await esperarCampo(() => itensAtivos(form).find(el => !antes.includes(el)), 5000);
+            if (LISTA_COM_MODAL) item.dataset.vacNovo = '1';
+            prepararItem(item);
+            return item;
+        }
+        function prepararLista(form) {
+            const container = form.querySelector('#item_container');
+            if (!LISTA_COM_MODAL || !container || !marcar(container, 'lista')) return;
+            container.classList.add('vac-com-lista');
+            // Dentro do quadro "VACINAS" do site, que senão ficaria vazio abaixo da lista.
+            const quadro = container.querySelector('.portlet-content') || container;
+            const el = $('<div>', { class: 'vac-lista' }).prependTo(quadro);
+            const tabela = $('<table>', { class: 'vac-lista-tabela' }).appendTo(el);
+            const cabecalho = $('<tr>').appendTo($('<thead>').appendTo(tabela));
+            ['Vacina', 'Dose', 'Estratégia', 'Lote', 'Fabricante', 'Via / Local', ''].forEach(texto => $('<th>', { scope: 'col', text: texto }).appendTo(cabecalho));
+            $('<tbody>').appendTo(tabela);
+            const botao = $('<button>', { type: 'button', class: 'btn btn-primary vac-aplicar', text: '＋ Aplicar vacina' }).appendTo(el);
+            const erro = $('<span>', { class: 'vac-nota', role: 'status' }).appendTo(el);
+            estados.get(form).lista = { el, timer: null };
+            botao.on('click', async () => {
+                botao.prop('disabled', true);
+                erro.text('');
+                try { abrirVacina(await criarItem(form)); }
+                catch (_) { erro.text('Não consegui incluir a vacina. Tente de novo.'); }
+                finally { botao.prop('disabled', false); }
+            });
+            $(container).on('change.vac input.vac cocoon:after-insert.vac cocoon:after-remove.vac', () => agendarLista(form));
+            new MutationObserver(mudancas => {
+                if (mudancas.some(m => !m.target.closest('.vac-lista'))) agendarLista(form);
+            }).observe(container, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'disabled', 'hidden'] });
+            renderizarLista(form);
+        }
+        function abrirVacina(item) {
+            if (!LISTA_COM_MODAL || modalVacina?.item === item || !itensAtivos(item.closest('form')).includes(item)) return;
+            if (modalVacina) fecharVacina();
+            prepararItem(item);
+            const atributos = ['role', 'aria-modal', 'aria-labelledby'].map(nome => [nome, item.getAttribute(nome)]);
+            const fundo = $('<div>', { class: 'vac-modal-fundo' }).appendTo(document.body).on('click', () => fecharVacina());
+            modalVacina = { item, form: item.closest('form'), fundo, atributos, overflow: document.body.style.overflow, foco: document.activeElement };
+            document.body.style.overflow = 'hidden';
+            isolarItem(item, false);
+            $(item).removeClass('vac-item-fechado').addClass('vac-item-modal').attr({ role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'vac-modal-titulo' });
+            const cabecalho = $('<div>', { class: 'vac-modal-cabecalho' }).prependTo(item);
+            $('<h2>', { id: 'vac-modal-titulo', text: item.dataset.vacNovo === '1' ? 'Aplicar vacina' : 'Editar vacina' }).appendTo(cabecalho);
+            $('<button>', { type: 'button', class: 'btn btn-mini', text: '✕', 'aria-label': 'Fechar' }).appendTo(cabecalho).on('click', () => fecharVacina());
+            const rodape = $('<div>', { class: 'vac-modal-rodape' }).appendTo(item);
+            $('<span>', { class: 'vac-modal-falta', role: 'alert' }).appendTo(rodape);
+            $('<button>', { type: 'button', class: 'btn btn-primary', text: 'Concluir' }).appendTo(rodape).on('click', concluirVacina);
+            $('<button>', { type: 'button', class: 'btn btn-default', text: item.dataset.vacNovo === '1' ? 'Descartar' : 'Fechar' }).appendTo(rodape).on('click', () => fecharVacina(item.dataset.vacNovo === '1'));
+            $(item).find('select').trigger('chosen:updated');
+            (item.querySelector('.vac-busca') || item.querySelector('select.tipo_imunobiologico'))?.focus();
+        }
+        function concluirVacina() {
+            if (!modalVacina) return true;
+            const item = modalVacina.item;
+            $(item).find('.vac-campo-falta').removeClass('vac-campo-falta');
+            const faltas = faltasItem(item);
+            $(item).find('.vac-modal-falta').text(faltas.length ? 'Preencha: ' + Array.from(new Set(faltas.map(f => f.texto))).join(', ') : '');
+            faltas.forEach(f => f.container.classList.add('vac-campo-falta'));
+            if (faltas.length) return false;
+            delete item.dataset.vacNovo;
+            fecharVacina();
+            return true;
+        }
+        function fecharVacina(descartar = false) {
+            if (!modalVacina) return;
+            const { item, form, fundo, atributos, overflow, foco } = modalVacina;
+            const remover = descartar || (item.dataset.vacNovo === '1' && !item.querySelector('select.tipo_imunobiologico')?.value);
+            modalVacina = null;
+            $(item).removeClass('vac-item-modal').addClass('vac-item-fechado');
+            isolarItem(item, true);
+            $(item).find('.vac-modal-cabecalho, .vac-modal-rodape').remove();
+            $(item).find('.vac-campo-falta').removeClass('vac-campo-falta');
+            atributos.forEach(([nome, valor]) => { if (valor === null) item.removeAttribute(nome); else item.setAttribute(nome, valor); });
+            fundo.remove();
+            document.body.style.overflow = overflow;
+            if (remover && item.isConnected) item.querySelector('a.remove_fields')?.click();
+            if (form) {
+                renderizarLista(form, remover ? null : item);
+                agendarHistorico(form);
+                const indice = itensAtivos(form).indexOf(item);
+                const editar = indice >= 0 ? estados.get(form)?.lista?.el.find('tbody tr').eq(indice).find('button').first()[0] : null;
+                if (!remover && editar) editar.focus({ preventScroll: true });
+                else if (foco?.isConnected) foco.focus({ preventScroll: true });
+            }
+        }
+        document.addEventListener('keydown', e => {
+            if (!modalVacina) return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                fecharVacina();
+            }
+        }, true);
         function agendar() {
             if (agendado) return;
             agendado = true;
@@ -234,24 +464,127 @@
         function chaveItem(item) {
             const imuno = $(item).find('select.tipo_imunobiologico').val();
             const campos = $(item).find('.esus-vacinacao-lote-select, .esus-vacinacao-lote-sem-estoque-input, .esus-vacinacao-lote-manual-registro-anterior-input');
-            const ativo = campos.filter(':visible').not(':disabled').first();
+            const ativo = LISTA_COM_MODAL ? $(campoLote(item)) : campos.filter(':visible').not(':disabled').first();
             const lote = String(ativo.length ? ativo.val() || '' : $(item).find('.esus-vacinacao-lote-hidden').val() || '').trim().toUpperCase();
             return imuno && lote ? imuno + '|' + lote : '';
+        }
+        function lerObjeto(chave) {
+            try {
+                const dados = JSON.parse(localStorage.getItem(chave) || '{}');
+                return dados && typeof dados === 'object' && !Array.isArray(dados) ? dados : {};
+            } catch (_) { return {}; }
+        }
+        // Fabricante preenchido pelo estoque (marcado pela nota) cede lugar à memória do lote.
+        function automatico(select) {
+            return $(select).siblings('.vac-fabricante-estoque').length > 0;
         }
         function lembrarFabricante(item) {
             if (!LOTE_FABRICANTE || !item.isConnected) return;
             const chave = chaveItem(item);
-            const lembrado = lerMemoria()[chave];
-            if (!chave || !lembrado || !lembrado.fabricante_id) return;
+            const lembrado = chave ? lerMemoria()[chave] : null;
+            if (!lembrado || !lembrado.fabricante_id) {
+                if (FABRICANTE_DO_ESTOQUE) preencherDoEstoque(item);
+                return;
+            }
             const selects = Array.from(item.querySelectorAll(FABRICANTE));
             // Um valor escolhido pelo usuário em qualquer um dos dois campos prevalece.
-            if (selects.some(s => s.value && s.value !== String(lembrado.fabricante_id))) return;
+            if (selects.some(s => s.value && s.value !== String(lembrado.fabricante_id) && !automatico(s))) return;
             selects.forEach(select => {
-                if (select.value || !Array.from(select.options).some(o => o.value === String(lembrado.fabricante_id))) return;
+                if ((select.value && !automatico(select)) || !Array.from(select.options).some(o => o.value === String(lembrado.fabricante_id))) return;
                 selecionar(select, lembrado.fabricante_id);
+                $(select).siblings('.vac-fabricante-estoque').remove();
                 if (!$(select).siblings('.vac-fabricante-lembrado').length) {
                     $('<span>', { class: 'vac-nota vac-fabricante-lembrado', text: 'fabricante lembrado deste lote' }).insertAfter(select);
                 }
+            });
+        }
+        function termosEstoque(tipoId, texto) {
+            const palavras = String(texto || '').replace(/^\s*vacina\s+/i, '').toLocaleLowerCase('pt-BR').match(/[\p{L}\p{N}]+/gu) || [];
+            const termos = [];
+            const primeira = palavras.find(p => p.length >= 3);
+            if (primeira) termos.push(primeira);
+            if (palavras.length >= 2) termos.push(palavras[0] + palavras[1]);
+            // Nomes da carteirinha já mapeados para este imunobiológico.
+            Object.entries(lerObjeto('vac-nome-imuno')).forEach(([nome, v]) => {
+                if (v && v.id != null && String(v.id) === tipoId) termos.push(nome);
+            });
+            return Array.from(new Set(termos)).filter(t => t.length >= 3);
+        }
+        async function consultarEstoque(tipoId, texto) {
+            let produtos = [];
+            for (const termo of termosEstoque(tipoId, texto)) {
+                const dados = await $.ajax({ url: '/produtos_controlaveis.json', data: { q: termo }, dataType: 'json', timeout: 15000 });
+                produtos = (Array.isArray(dados) ? dados : []).filter(v => v && v.controlavel_type === 'Vacina' && String(v.esus_vacinas_tipo_imunobiologico_id) === tipoId);
+                if (produtos.length) break;
+            }
+            const ids = Array.from(new Set(produtos.map(v => v.id))).slice(0, 5);
+            const paginas = await Promise.all(ids.map(id => Promise.resolve($.ajax({ url: '/entradas_estoques/' + encodeURIComponent(id), dataType: 'html', timeout: 15000 }))));
+            const nomes = new Map();
+            paginas.forEach(html => {
+                const pagina = new DOMParser().parseFromString(html, 'text/html');
+                const strong = Array.from(pagina.querySelectorAll('strong')).find(s => s.textContent.trim() === 'Fabricante');
+                const nome = strong ? $(strong).closest('li').next('li').text().trim() : '';
+                if (normalizar(nome)) nomes.set(normalizar(nome), nome);
+            });
+            return Array.from(nomes.values());
+        }
+        function fabricanteDoEstoque(tipoId, textoOpcao) {
+            tipoId = String(tipoId);
+            if (!estoqueFabricantes.has(tipoId)) {
+                const promessa = (async () => {
+                    const salvo = lerObjeto(CHAVE_ESTOQUE)[tipoId];
+                    if (salvo && Array.isArray(salvo.nomes) && salvo.nomes.length && Date.now() - salvo.ts < 86400000) return salvo.nomes;
+                    const nomes = await consultarEstoque(tipoId, textoOpcao);
+                    if (nomes.length) {
+                        try {
+                            const atuais = lerObjeto(CHAVE_ESTOQUE);
+                            atuais[tipoId] = { nomes, ts: Date.now() };
+                            localStorage.setItem(CHAVE_ESTOQUE, JSON.stringify(atuais));
+                        } catch (_) { /* Seguir sem memória. */ }
+                    }
+                    return nomes;
+                })();
+                estoqueFabricantes.set(tipoId, promessa);
+                // Falha de rede não fica em cache; a próxima tentativa consulta de novo.
+                promessa.catch(() => estoqueFabricantes.delete(tipoId));
+            }
+            return estoqueFabricantes.get(tipoId);
+        }
+        function opcaoFabricante(select, nome) {
+            const opcoes = Array.from(select.options).filter(o => o.value).map(o => ({ valor: o.value, texto: normalizar(o.textContent) })).filter(o => o.texto);
+            const iguais = opcoes.filter(o => o.texto === nome);
+            if (iguais.length) return iguais.length === 1 ? iguais[0].valor : '';
+            // Só por prefixo: "india" não deve virar SERUM-INDIA, que pode ser outro fabricante.
+            const contem = opcoes.filter(o => o.texto.length >= 3 && nome.length >= 3 && (o.texto.startsWith(nome) || nome.startsWith(o.texto)));
+            return contem.length === 1 ? contem[0].valor : '';
+        }
+        async function preencherDoEstoque(item) {
+            const imuno = item.querySelector('select.tipo_imunobiologico');
+            const tipo = imuno && imuno.value;
+            if (!tipo) return;
+            const opcao = imuno.options[imuno.selectedIndex];
+            let nomes;
+            try { nomes = await fabricanteDoEstoque(tipo, opcao.dataset.vacTexto || opcao.textContent); } catch (_) { return; }
+            if (!nomes.length || !item.isConnected || imuno.value !== tipo) return;
+            // A memória do lote vence o estoque, mesmo quando o lote foi escolhido durante a consulta.
+            const chave = chaveItem(item);
+            if (chave && (lerMemoria()[chave] || {}).fabricante_id) return;
+            const selects = Array.from(item.querySelectorAll(FABRICANTE));
+            if (selects.some(s => s.value)) return;
+            const maiusculas = nome => nome.toLocaleUpperCase('pt-BR');
+            const nome = nomes.length === 1 ? normalizar(nomes[0]) : '';
+            selects.forEach(select => {
+                $(select).siblings('.vac-fabricante-estoque').remove();
+                let texto;
+                if (nomes.length > 1) texto = 'Fabricantes no estoque: ' + nomes.map(maiusculas).join(', ') + ' — escolha conforme o lote';
+                else {
+                    const valor = opcaoFabricante(select, nome);
+                    if (valor) {
+                        selecionar(select, valor);
+                        texto = 'fabricante do cadastro da vacina no estoque';
+                    } else texto = 'Fabricante no estoque: ' + maiusculas(nomes[0]) + ' — não está na lista do e-SUS, escolha manualmente';
+                }
+                $('<span>', { class: 'vac-nota vac-fabricante-estoque', text: texto }).insertAfter(select);
             });
         }
         function aprender(form) {
@@ -261,7 +594,7 @@
                 const chave = chaveItem(item);
                 const selects = $(item).find(FABRICANTE);
                 // Chosen oculta o select; a visibilidade do li identifica o campo em uso.
-                const fabricante = selects.filter(function () { return $(this).closest('li').is(':visible'); }).first().val() ||
+                const fabricante = selects.filter(function () { return LISTA_COM_MODAL ? campoEmUso(this, item) : $(this).closest('li').is(':visible'); }).first().val() ||
                     selects.filter(function () { return !!this.value; }).first().val();
                 if (chave && fabricante) memoria[chave] = { fabricante_id: String(fabricante), ts: Date.now() };
             });
@@ -335,15 +668,20 @@
         }
         function prepararForm(form) {
             if (!marcar(form, 'formulario')) return;
-            estados.set(form, { cpf: 'pendente', consulta: 0, ignorarDuplicadas: false, botao: null });
+            estados.set(form, { cpf: 'pendente', consulta: 0, ignorarDuplicadas: false, botao: null, maternalLimpo: false });
             if (LOCAL_UBS) {
                 const local = form.querySelector('#esus_vacinacao_local_atendimento_id');
                 if (local && !local.value) selecionar(local, '1');
             }
             if (MATERNAL_SEM_PADRAO && /^\/esus\/vacinacoes\/new\/?$/.test(location.pathname)) {
-                $(form).find(MATERNAL).prop('checked', false);
-                const campo = $(form).find('.condicoes-agrupamento-maternal').addClass('vac-maternal');
-                $('<small>', { class: 'vac-nota vac-escolha-maternal', text: 'Escolha uma opção' }).appendTo(campo);
+                // Para munícipe masculino o site oculta o grupo mas mantém "Nenhuma" marcada.
+                const campo = $(form).find('.condicoes-agrupamento-maternal');
+                if (campo.is(':visible')) {
+                    $(form).find(MATERNAL).prop('checked', false);
+                    estados.get(form).maternalLimpo = true;
+                    campo.addClass('vac-maternal');
+                    $('<small>', { class: 'vac-nota vac-escolha-maternal', text: 'Escolha uma opção' }).appendTo(campo);
+                }
             }
             if (CPF_OBRIGATORIO) consultarCpf(form);
         }
@@ -471,7 +809,9 @@
                 });
                 recolherPainel();
             }
-            new MutationObserver(() => agendarHistorico(form)).observe(form.querySelector('#item_container'), { childList: true, subtree: true });
+            new MutationObserver(mudancas => {
+                if (mudancas.some(m => !m.target.closest('.vac-lista'))) agendarHistorico(form);
+            }).observe(form.querySelector('#item_container'), { childList: true, subtree: true });
             carregarHistorico(form);
         }
         async function carregarHistorico(form) {
@@ -633,10 +973,9 @@
             try {
                 item = itensAtivos(form).find(el => !el.querySelector('select.tipo_imunobiologico')?.value);
                 if (!item) {
-                    const antes = itensAtivos(form);
-                    form.querySelector('#item_container a.add_fields')?.click();
-                    item = await esperarCampo(() => itensAtivos(form).find(el => !antes.includes(el)), 5000);
+                    item = await criarItem(form);
                 }
+                if (LISTA_COM_MODAL) item.dataset.vacNovo = '1';
                 prepararItem(item);
                 $(item).find('.vac-hist-manual').remove();
                 const busca = item.querySelector('.vac-busca');
@@ -658,14 +997,18 @@
                 $(destino).find('.vac-hist-manual').remove();
                 $('<small>', { class: 'vac-nota vac-hist-manual', text: 'Complete a estratégia/dose manualmente' }).appendTo(destino);
             } finally {
-                if (item?.isConnected) destacar(item);
+                if (item?.isConnected) {
+                    if (LISTA_COM_MODAL) abrirVacina(item);
+                    else destacar(item);
+                }
                 lancandoDose = false;
                 agendarHistorico(form);
             }
         }
         function pendencias(form) {
             const lista = [];
-            if (MATERNAL_SEM_PADRAO && form.querySelector(MATERNAL) && !form.querySelector(MATERNAL + ':checked')) {
+            if (MATERNAL_SEM_PADRAO && form.querySelector(MATERNAL) && !form.querySelector(MATERNAL + ':checked') &&
+                $(form).find('.condicoes-agrupamento-maternal').is(':visible')) {
                 lista.push({ texto: 'Maternal: escolha uma opção.', alvo: form.querySelector('.condicoes-agrupamento-maternal') });
             }
             if (CPF_OBRIGATORIO && estados.get(form).cpf === 'falta') {
@@ -712,7 +1055,11 @@
             if (!lista.length) return;
             const banner = $('<div>', { id: 'vac-pendencias', class: 'vac-aviso vac-erro', role: 'alert', tabindex: '-1' }).prependTo(form);
             $('<strong>', { text: 'Confira as pendências antes de salvar:' }).appendTo(banner);
-            lista.forEach(p => $('<a>', { href: '#', class: 'vac-link vac-pendencia', text: p.texto }).appendTo(banner).on('click', e => { e.preventDefault(); destacar(p.alvo); }));
+            lista.forEach(p => $('<a>', { href: '#', class: 'vac-link vac-pendencia', text: p.texto }).appendTo(banner).on('click', e => {
+                e.preventDefault();
+                if (LISTA_COM_MODAL && p.alvo?.matches('.nested-fields')) abrirVacina(p.alvo);
+                else destacar(p.alvo);
+            }));
             if (lista.some(p => p.duplicada)) {
                 $('<button>', { type: 'button', text: 'Salvar mesmo assim' }).appendTo(banner).on('click', () => {
                     if (!confirm('Há vacina e dose duplicadas nesta ficha. Deseja salvar mesmo assim?')) return;
@@ -728,9 +1075,19 @@
         function proteger(e, form, botao) {
             prepararForm(form);
             const estado = estados.get(form);
+            // Grupo limpo por nós e depois oculto: devolver "Nenhuma" para o servidor receber o valor original.
+            if (estado.maternalLimpo && !$(form).find('.condicoes-agrupamento-maternal').is(':visible') && !form.querySelector(MATERNAL + ':checked')) {
+                $(form).find(MATERNAL).filter('[value="1"]').prop('checked', true);
+            }
             if (botao) {
                 estado.botao = botao;
                 if (!botao.dataset.vacTextoBotao) botao.dataset.vacTextoBotao = botao.tagName === 'INPUT' ? botao.value : botao.textContent.trim();
+            }
+            if (LISTA_COM_MODAL && modalVacina?.form === form && !concluirVacina()) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                reabilitar(botao || estado.botao);
+                return;
             }
             const lista = pendencias(form).filter(p => !(estado.ignorarDuplicadas && p.duplicada));
             if (lista.length) {
@@ -769,10 +1126,14 @@
             const campo = $(this).closest('.condicoes-agrupamento-maternal');
             campo.removeClass('vac-maternal').find('.vac-escolha-maternal').remove();
         }).on('change.vac', FABRICANTE, function () {
-            $(this).siblings('.vac-fabricante-lembrado').remove();
+            $(this).siblings('.vac-fabricante-lembrado, .vac-fabricante-estoque').remove();
         }).on('change.vac', '#item_container select.tipo_imunobiologico, #item_container select[id*="tipo_dose_id"]', function () {
             agendarHistorico(this.closest('form'));
+        }).on('cocoon:before-remove.vac', '#item_container', function (e, no) {
+            const item = $(no || e.target).closest('.nested-fields')[0];
+            if (item) { item.classList.add('vac-item-removido'); isolarItem(item, true); }
         }).on('cocoon:after-insert.vac cocoon:after-remove.vac', '#item_container', function () {
+            isolarRemovidos(this.closest('form'));
             agendar();
             agendarHistorico(this.closest('form'));
         });
@@ -781,11 +1142,15 @@
             processarModal();
             document.querySelectorAll(FORMULARIOS).forEach(form => {
                 prepararForm(form);
+                isolarRemovidos(form);
                 form.querySelectorAll('#item_container .nested-fields').forEach(prepararItem);
+                prepararLista(form);
                 prepararHistorico(form);
             });
         }
-        new MutationObserver(agendar).observe(document.body, { childList: true, subtree: true });
+        new MutationObserver(mudancas => {
+            if (mudancas.some(m => !m.target.closest('.vac-lista'))) agendar();
+        }).observe(document.body, { childList: true, subtree: true });
         processar();
     }
 })();
