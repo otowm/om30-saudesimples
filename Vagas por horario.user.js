@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.10.0
+// @version      1.11.0
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma e quantas estão livres.
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/agendamentos*
@@ -27,7 +27,8 @@
     especificaSubstitui: true,
 
     cancelados: 'NÃO',   // filtro do consultar_agendas: 'SIM', 'NÃO' ou '' (todos)
-    maxPaginas: 5,       // páginas seguidas na paginação do consultar_agendas
+    maxPaginas: 10,      // limite de páginas na paginação do consultar_agendas
+    timeoutFetchMs: 25000,
     debounceMs: 400,
     esperaTabelaMs: 12000, // quanto tempo esperar a tabela de horários aparecer
     ttlCacheMs: 60000,     // cache do consultar_agendas por data/profissional
@@ -333,17 +334,94 @@
   /* ================== Leitura da configuração da agenda (/agendas/ID) ================== */
 
   const cacheConfig = new Map(); // agendaId -> Promise<config>
+  const atualizacoesConfig = new Map(); // agendaId -> revalidação da página
+  const prefixoConfig = `ssvh:cfg:${location.hostname}:`;
+  const validadeConfigMs = 7 * 24 * 60 * 60 * 1000;
+
+  async function fetchComTimeout(url, opcoes) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CONFIG.timeoutFetchMs);
+    try {
+      const resp = await fetch(url, { ...opcoes, signal: controller.signal });
+      const texto = await resp.text();
+      return { ok: resp.ok, status: resp.status, text: async () => texto };
+    } catch (e) {
+      if (controller.signal.aborted) throw new Error('tempo esgotado');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function reidratarConfig(config) {
+    config.periodos.forEach((p) => {
+      const inicio = dataBRParaDate(p.dataInicial);
+      const fim = dataBRParaDate(p.dataFinal);
+      p.inicioTs = inicio ? soDia(inicio) : -Infinity;
+      p.fimTs = fim ? soDia(fim) : Infinity;
+    });
+    config.especificas.forEach((e) => {
+      const data = dataBRParaDate(e.data);
+      e.ts = data ? soDia(data) : null;
+    });
+    return config;
+  }
 
   function obterConfigAgenda(agendaId) {
     if (!cacheConfig.has(agendaId)) {
-      cacheConfig.set(agendaId, (async () => {
-        const resp = await fetch(`/agendas/${agendaId}`, { credentials: 'same-origin' });
+      let salva = null;
+      try {
+        // Remove também agendas antigas que não aparecem nesta tela.
+        for (const chave of Object.keys(localStorage)) {
+          if (!chave.startsWith(prefixoConfig)) continue;
+          let entrada = null;
+          try { entrada = JSON.parse(localStorage.getItem(chave)); } catch (_) { /* entrada inválida */ }
+          if (!entrada || !entrada.salvoEm || Date.now() - entrada.salvoEm > validadeConfigMs) {
+            localStorage.removeItem(chave);
+          }
+        }
+        const entrada = JSON.parse(localStorage.getItem(prefixoConfig + agendaId));
+        if (entrada) salva = reidratarConfig(entrada.config);
+      } catch (_) { /* cache indisponível */ }
+
+      const fresca = (async () => {
+        const resp = await fetchComTimeout(`/agendas/${agendaId}`, { credentials: 'same-origin' });
         if (!resp.ok) throw new Error(`HTTP ${resp.status} ao abrir /agendas/${agendaId}`);
         const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
-        return parsearConfigAgenda(doc, agendaId);
-      })().catch((e) => { cacheConfig.delete(agendaId); throw e; }));
+        const config = parsearConfigAgenda(doc, agendaId);
+        try {
+          localStorage.setItem(prefixoConfig + agendaId, JSON.stringify({ salvoEm: Date.now(), config }));
+        } catch (_) { /* sem espaço ou armazenamento indisponível */ }
+        cacheConfig.set(agendaId, Promise.resolve(config));
+        return config;
+      })();
+      atualizacoesConfig.set(agendaId, fresca);
+      fresca.catch((e) => {
+        if (!salva) cacheConfig.delete(agendaId);
+        else warn('falha ao atualizar configuração da agenda:', e);
+      });
+      cacheConfig.set(agendaId, salva ? Promise.resolve(salva) : fresca);
     }
     return cacheConfig.get(agendaId);
+  }
+
+  function iniciarPrefetchConfig() {
+    const procurar = (raiz) => {
+      if (!(raiz instanceof Element)) return;
+      const seletor = '[class*="calendar_"], a[data-agenda]';
+      const elementos = [...raiz.querySelectorAll(seletor)];
+      if (raiz.matches(seletor)) elementos.push(raiz);
+      elementos.forEach((el) => {
+        const ids = [...(el.getAttribute('class') || '').matchAll(/(?:^|\s)calendar_(\d+)/g)].map((m) => m[1]);
+        if (el.dataset.agenda) ids.push(el.dataset.agenda);
+        ids.forEach((id) => obterConfigAgenda(id).catch((e) => warn('falha ao antecipar configuração:', e)));
+      });
+    };
+    const observer = new MutationObserver((registros) => {
+      registros.forEach((r) => r.addedNodes.forEach(procurar));
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    procurar(document.documentElement);
   }
 
   /**
@@ -627,6 +705,7 @@
   function montarUrlConsulta(dataStr, profissionalId) {
     const p = new URLSearchParams();
     p.set('utf8', '✓');
+    p.set('per_page', '100');
     p.set('filtro_consultar_agenda[data_inicial]', dataStr);
     p.set('filtro_consultar_agenda[data_final]', dataStr);
     p.set('filtro_consultar_agenda[modulo]', '');
@@ -679,17 +758,32 @@
     if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
 
     const promise = (async () => {
-      const parser = new DOMParser();
-      let url = montarUrlConsulta(dataStr, profissionalId);
-      let todas = [];
-      for (let pagina = 1; pagina <= CONFIG.maxPaginas && url; pagina += 1) {
-        const resp = await fetch(url, { credentials: 'same-origin' });
+      const urlInicial = new URL(montarUrlConsulta(dataStr, profissionalId), location.origin);
+      const lerPagina = async (url) => {
+        const resp = await fetchComTimeout(url, { credentials: 'same-origin' });
         if (!resp.ok) throw new Error(`HTTP ${resp.status} no consultar_agendas`);
-        const doc = parser.parseFromString(await resp.text(), 'text/html');
-        todas = todas.concat(parsearLinhasConsulta(doc));
-        const next = doc.querySelector('.pagination a.next_page');
-        url = next ? next.getAttribute('href') : null;
+        return new DOMParser().parseFromString(await resp.text(), 'text/html');
+      };
+      const primeira = await lerPagina(urlInicial.href);
+      const numeros = [...primeira.querySelectorAll('.pagination a, .pagination em.current')]
+        .map((el) => /^\d+$/.test(el.textContent.trim()) ? Number(el.textContent.trim()) : 1);
+      const total = Math.min(CONFIG.maxPaginas, Math.max(1, ...numeros));
+      const paginas = await Promise.all(Array.from({ length: total - 1 }, (_, i) => {
+        const url = new URL(urlInicial);
+        url.searchParams.set('page', String(i + 2));
+        return lerPagina(url.href);
+      }));
+      const docs = [primeira, ...paginas];
+      // Uma lacuna pode esconder páginas além dos números visíveis.
+      const temLacuna = !!primeira.querySelector('.pagination .gap')
+        || /[…]|\.\.\./.test(primeira.querySelector('.pagination')?.textContent || '');
+      let next = docs[docs.length - 1].querySelector('.pagination a.next_page');
+      while ((temLacuna || total === 1) && next && docs.length < CONFIG.maxPaginas) {
+        const doc = await lerPagina(new URL(next.getAttribute('href'), urlInicial).href);
+        docs.push(doc);
+        next = doc.querySelector('.pagination a.next_page');
       }
+      const todas = docs.flatMap(parsearLinhasConsulta);
       return todas;
     })();
 
@@ -769,7 +863,7 @@
         consultar: '',
       });
 
-      const resp = await fetch('/atendimentos_medicos_administrativo', {
+      const resp = await fetchComTimeout('/atendimentos_medicos_administrativo', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {
@@ -859,16 +953,21 @@
     const elInicial = inicial.tabela;
 
     return new Promise((resolve) => {
-      const inicio = Date.now();
+      const concluir = (atual) => {
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(atual);
+      };
       const tentar = () => {
         const atual = localizarAlvo(agendaId);
         const jaEhDesteDia = atual.tabela && atual.tabela.dataset.ssvhChave === chave;
         const mudou = atual.tabela !== elInicial
           || assinaturaTabela(atual.tabela) !== assinaturaInicial;
-        if (jaEhDesteDia || mudou) return resolve(atual);
-        if (Date.now() - inicio > timeout) return resolve(atual);
-        setTimeout(tentar, 200);
+        if (jaEhDesteDia || mudou) concluir(atual);
       };
+      const observer = new MutationObserver(tentar);
+      observer.observe(document.body, { childList: true, subtree: true });
+      const timer = setTimeout(() => concluir(localizarAlvo(agendaId)), timeout);
       tentar();
     });
   }
@@ -884,6 +983,13 @@
         margin: 6px 0; padding: 6px 8px; border: 1px solid #d5d5d5; border-radius: 5px;
         background: #fafafa; font: 11px/1.5 Arial, sans-serif; color: #333;
       }
+      .ssvh-carregando::before {
+        content: ''; display: inline-block; width: 10px; height: 10px; margin-right: 6px;
+        border: 2px solid #ccc; border-top-color: #06c; border-radius: 50%;
+        animation: ssvh-gira .8s linear infinite; vertical-align: middle;
+      }
+      @keyframes ssvh-gira { to { transform: rotate(360deg); } }
+      .ssvh-resumo.ssvh-alerta { color: #b35900; }
       .ssvh-resumo b { font-size: 11px; }
       .ssvh-resumo a { color: #06c; }
       .ssvh-resumo .ssvh-alerta { color: #b35900; }
@@ -1482,12 +1588,14 @@
 
   let ultimaChave = '';
   let ultimoTs = 0;
+  let geracaoDia = 0;
 
 
   async function aoSelecionarDia({ agendaId, dia, mes, ano, tipoId }) {
     const chave = `${agendaId}|${dia}/${mes}/${ano}|${tipoId}`;
     const agora = Date.now();
     if (chave === ultimaChave && agora - ultimoTs < CONFIG.debounceMs) return;
+    const geracao = ++geracaoDia;
     ultimaChave = chave;
     ultimoTs = agora;
 
@@ -1497,132 +1605,180 @@
     const tipoChave = TIPO_POR_ID[String(tipoId)] || 'nova_consulta';
     const avisos = [];
 
+    let box = null;
+    const pendentes = new Set(['configuração', 'agendamentos', 'atendimentos']);
+    const atualizarProgresso = () => {
+      if (box && geracao === geracaoDia) {
+        box.innerHTML = `Carregando vagas… <span class="ssvh-det">${[...pendentes].join(', ')}</span>`;
+      }
+    };
+    const acompanhar = (nome, promise) => promise.finally(() => {
+      pendentes.delete(nome);
+      atualizarProgresso();
+    });
     try {
-      const alvo = await esperarAlvo(agendaId, chave, CONFIG.esperaTabelaMs);
+      const profissionalId = getProfissionalIdSelecionado();
+      const configPromise = acompanhar('configuração', obterConfigAgenda(agendaId));
+      const linhasPromise = acompanhar('agendamentos', buscarAgendamentosDoDia(dataStr, profissionalId))
+        .catch((e) => {
+          avisos.push(`Não foi possível ler os agendamentos do dia (${e.message}).`);
+          return [];
+        });
+      const especialidadeDom = getEspecialidadeId();
+      const especialidadePromise = especialidadeDom || !profissionalId
+        ? Promise.resolve(especialidadeDom)
+        : configPromise.then((config) => geracao === geracaoDia ? getEspecialidadeId(config) : '');
+      const atendimentosPromise = acompanhar('atendimentos', especialidadePromise.then((especialidadeId) => {
+        if (geracao !== geracaoDia) return [];
+        return buscarAtendimentosDoDia(dataStr, profissionalId, especialidadeId);
+      })).catch((e) => {
+        avisos.push(`Não foi possível ler a lista de atendimentos (${e.message}).`);
+        return [];
+      });
+      const alvoPromise = esperarAlvo(agendaId, chave, CONFIG.esperaTabelaMs).then((alvo) => {
+        if (geracao !== geracaoDia) return alvo;
+        const destino = alvo.container || (alvo.tabela && alvo.tabela.parentElement);
+        if (destino) {
+          injetarCss();
+          destino.querySelectorAll('.ssvh-resumo').forEach((el) => el.remove());
+          box = document.createElement('div');
+          box.className = 'ssvh-resumo ssvh-carregando';
+          atualizarProgresso();
+          if (alvo.tabela && alvo.tabela.parentElement === destino) destino.insertBefore(box, alvo.tabela);
+          else destino.appendChild(box);
+        }
+        return alvo;
+      });
+      // Aguarda também o alvo para poder mostrar uma eventual falha fatal.
+      const [configResultado, linhasResultado, atendimentosResultado, alvoResultado] = await Promise.allSettled([
+        configPromise, linhasPromise, atendimentosPromise, alvoPromise,
+      ]);
+      if (geracao !== geracaoDia) return;
+      if (configResultado.status === 'rejected') throw configResultado.reason;
+      if (alvoResultado.status === 'rejected') throw alvoResultado.reason;
+      const config = configResultado.value;
+      const linhas = linhasResultado.value;
+      const atendimentos = atendimentosResultado.value;
+      const alvo = alvoResultado.value;
+      const especialidadeId = especialidadeDom || getEspecialidadeId(config);
+      if (!especialidadeId) {
+        avisos.push('Especialidade não identificada: os nomes dos pacientes por horário não foram carregados.');
+      }
       if (!alvo.tabela && !alvo.container) {
         warn('bloco da agenda não encontrado na tela para a agenda', agendaId);
         return;
       }
       if (!alvo.tabela) avisos.push('Nenhuma vaga livre listada nesta data.');
-
-      const config = await obterConfigAgenda(agendaId);
-
-      const profissionalId = getProfissionalIdSelecionado();
       if (!profissionalId) avisos.push('Profissional não selecionado na tela: a consulta usou só a unidade e foi filtrada pelo nome do profissional da agenda.');
 
-      let linhas = [];
-      try {
-        linhas = await buscarAgendamentosDoDia(dataStr, profissionalId);
-      } catch (e) {
-        avisos.push(`Não foi possível ler os agendamentos do dia (${e.message}).`);
-      }
+      const montar = (config) => {
+        const avisosPintura = [...avisos];
+        const profNorm = normalizar(config.profissional);
+        const procNorm = normalizar(config.procedimento);
+        const doProfissional = linhas.filter((l) => !profNorm || normalizar(l.profissional) === profNorm);
 
-      const profNorm = normalizar(config.profissional);
-      const procNorm = normalizar(config.procedimento);
-      const doProfissional = linhas.filter((l) => !profNorm || normalizar(l.profissional) === profNorm);
-
-      // Lista de atendimentos: traz o paciente que está em cada vaga.
-      const especialidadeId = getEspecialidadeId(config);
-      let atendimentos = [];
-      if (profissionalId && especialidadeId) {
-        try {
-          atendimentos = await buscarAtendimentosDoDia(dataStr, profissionalId, especialidadeId);
-        } catch (e) {
-          avisos.push(`Não foi possível ler a lista de atendimentos (${e.message}).`);
-        }
-      } else if (!especialidadeId) {
-        avisos.push('Especialidade não identificada: os nomes dos pacientes por horário não foram carregados.');
-      }
-
-      // Ocupação: prefere a lista de atendimentos (tem paciente e prontuário);
-      // o consultar_agendas completa o procedimento de cada linha.
-      let ocupacoes;
-      if (atendimentos.length) {
-        ocupacoes = atendimentos.map((a) => {
-          let procedimento = a.procedimento;
-          if (!procedimento) {
-            const par = doProfissional.find((l) => l.hora === a.hora
-              && (!a.paciente || normalizar(l.municipe) === normalizar(a.paciente)));
-            if (par) procedimento = par.procedimento;
-          }
-          return { ...a, procedimento };
-        });
-      } else {
-        ocupacoes = doProfissional.map((l) => ({
-          hora: l.hora,
-          paciente: l.municipe,
-          prontuario: l.prontuario,
-          procedimento: l.procedimento,
-          situacao: l.situacao,
-        }));
-      }
-
-      // Só as vagas do procedimento desta agenda (linhas sem procedimento ficam).
-      const ocupacoesAgenda = procNorm
-        ? ocupacoes.filter((o) => !o.procedimento || normalizar(o.procedimento) === procNorm)
-        : ocupacoes;
-
-      const ocupadasPorHora = new Map();
-      const detalhesPorHora = new Map();
-      ocupacoesAgenda.forEach((o) => {
-        if (!o.hora) return;
-        ocupadasPorHora.set(o.hora, (ocupadasPorHora.get(o.hora) || 0) + 1);
-        if (!detalhesPorHora.has(o.hora)) detalhesPorHora.set(o.hora, []);
-        detalhesPorHora.get(o.hora).push(o);
-      });
-
-      // Tudo que existe naquele horário, inclusive o que foi descartado pelos
-      // filtros — serve para explicar um horário sem nomes no popover.
-      const detalhesTodosPorHora = new Map();
-      ocupacoes.forEach((o) => {
-        if (!o.hora) return;
-        if (!detalhesTodosPorHora.has(o.hora)) detalhesTodosPorHora.set(o.hora, []);
-        detalhesTodosPorHora.get(o.hora).push(o);
-      });
-
-      // Se a lista traz o tipo de vaga, dá pra separar as ocupadas do tipo
-      // selecionado; senão, o cálculo cai para "configuradas − livres" no chip.
-      const temTipoVaga = ocupacoesAgenda.some((o) => tipoDaOcupacao(o));
-      let ocupadasTipoPorHora = null;
-      let detalhesTipoPorHora = null;
-      if (temTipoVaga) {
-        ocupadasTipoPorHora = new Map();
-        detalhesTipoPorHora = new Map();
-        ocupacoesAgenda
-          .filter((o) => tipoDaOcupacao(o) === tipoChave)
-          .forEach((o) => {
-            if (!o.hora) return;
-            ocupadasTipoPorHora.set(o.hora, (ocupadasTipoPorHora.get(o.hora) || 0) + 1);
-            if (!detalhesTipoPorHora.has(o.hora)) detalhesTipoPorHora.set(o.hora, []);
-            detalhesTipoPorHora.get(o.hora).push(o);
+        // Ocupação: prefere a lista de atendimentos (tem paciente e prontuário);
+        // o consultar_agendas completa o procedimento de cada linha.
+        let ocupacoes;
+        if (atendimentos.length) {
+          ocupacoes = atendimentos.map((a) => {
+            let procedimento = a.procedimento;
+            if (!procedimento) {
+              const par = doProfissional.find((l) => l.hora === a.hora
+                && (!a.paciente || normalizar(l.municipe) === normalizar(a.paciente)));
+              if (par) procedimento = par.procedimento;
+            }
+            return { ...a, procedimento };
           });
-      }
+        } else {
+          ocupacoes = doProfissional.map((l) => ({
+            hora: l.hora,
+            paciente: l.municipe,
+            prontuario: l.prontuario,
+            procedimento: l.procedimento,
+            situacao: l.situacao,
+          }));
+        }
 
-      const configuradas = vagasConfiguradasNaData(config, dataObj);
+        // Só as vagas do procedimento desta agenda (linhas sem procedimento ficam).
+        const ocupacoesAgenda = procNorm
+          ? ocupacoes.filter((o) => !o.procedimento || normalizar(o.procedimento) === procNorm)
+          : ocupacoes;
 
-      const tsData = soDia(dataObj);
-      const periodosValendo = config.periodos.filter((p) => tsData >= p.inicioTs && tsData <= p.fimTs
-        && p.horarios.some((h) => h.diaSemana === dataObj.getDay()));
-      if (periodosValendo.length > 1) {
-        avisos.push(`Atenção: ${periodosValendo.length} períodos sobrepostos valem para esta data — as vagas configuradas estão somadas.`);
-      }
+        const ocupadasPorHora = new Map();
+        const detalhesPorHora = new Map();
+        ocupacoesAgenda.forEach((o) => {
+          if (!o.hora) return;
+          ocupadasPorHora.set(o.hora, (ocupadasPorHora.get(o.hora) || 0) + 1);
+          if (!detalhesPorHora.has(o.hora)) detalhesPorHora.set(o.hora, []);
+          detalhesPorHora.get(o.hora).push(o);
+        });
 
-      if (!configuradas.size) {
-        avisos.push('Nenhum horário configurado bate com esta data (confira período, dia da semana e agenda específica).');
-      }
+        // Tudo que existe naquele horário, inclusive o que foi descartado pelos
+        // filtros — serve para explicar um horário sem nomes no popover.
+        const detalhesTodosPorHora = new Map();
+        ocupacoes.forEach((o) => {
+          if (!o.hora) return;
+          if (!detalhesTodosPorHora.has(o.hora)) detalhesTodosPorHora.set(o.hora, []);
+          detalhesTodosPorHora.get(o.hora).push(o);
+        });
 
-      const dados = {
-        agendaId, chave, dataStr, tipoChave, config, configuradas,
-        ocupadasPorHora, detalhesPorHora, detalhesTodosPorHora, ocupacoesAgenda,
-        ocupadasTipoPorHora, detalhesTipoPorHora, temTipoVaga,
-        bloqueios: bloqueiosNaData(config, dataObj),
-        avisos,
+        // Se a lista traz o tipo de vaga, dá pra separar as ocupadas do tipo
+        // selecionado; senão, o cálculo cai para "configuradas − livres" no chip.
+        const temTipoVaga = ocupacoesAgenda.some((o) => tipoDaOcupacao(o));
+        let ocupadasTipoPorHora = null;
+        let detalhesTipoPorHora = null;
+        if (temTipoVaga) {
+          ocupadasTipoPorHora = new Map();
+          detalhesTipoPorHora = new Map();
+          ocupacoesAgenda
+            .filter((o) => tipoDaOcupacao(o) === tipoChave)
+            .forEach((o) => {
+              if (!o.hora) return;
+              ocupadasTipoPorHora.set(o.hora, (ocupadasTipoPorHora.get(o.hora) || 0) + 1);
+              if (!detalhesTipoPorHora.has(o.hora)) detalhesTipoPorHora.set(o.hora, []);
+              detalhesTipoPorHora.get(o.hora).push(o);
+            });
+        }
+
+        const configuradas = vagasConfiguradasNaData(config, dataObj);
+
+        const tsData = soDia(dataObj);
+        const periodosValendo = config.periodos.filter((p) => tsData >= p.inicioTs && tsData <= p.fimTs
+          && p.horarios.some((h) => h.diaSemana === dataObj.getDay()));
+        if (periodosValendo.length > 1) {
+          avisosPintura.push(`Atenção: ${periodosValendo.length} períodos sobrepostos valem para esta data — as vagas configuradas estão somadas.`);
+        }
+
+        if (!configuradas.size) {
+          avisosPintura.push('Nenhum horário configurado bate com esta data (confira período, dia da semana e agenda específica).');
+        }
+
+        const dados = {
+          agendaId, chave, dataStr, tipoChave, config, configuradas,
+          ocupadasPorHora, detalhesPorHora, detalhesTodosPorHora, ocupacoesAgenda,
+          ocupadasTipoPorHora, detalhesTipoPorHora, temTipoVaga,
+          bloqueios: bloqueiosNaData(config, dataObj),
+          avisos: avisosPintura,
+        };
+
+        pintar(alvo, dados);
+        window.__ssVagas = { ...dados, linhas, doProfissional, atendimentos, especialidadeId };
+        log('resultado', window.__ssVagas);
       };
-
-      pintar(alvo, dados);
-      window.__ssVagas = { ...dados, linhas, doProfissional, atendimentos, especialidadeId };
-      log('resultado', window.__ssVagas);
+      montar(config);
+      atualizacoesConfig.get(agendaId).then((fresca) => {
+        if (geracao !== geracaoDia || JSON.stringify(fresca) === JSON.stringify(config)) return;
+        const atual = localizarAlvo(agendaId);
+        if (atual.tabela !== alvo.tabela || atual.container !== alvo.container) return;
+        montar(fresca);
+      }).catch(() => { /* revalidação já registrada no cache */ });
     } catch (e) {
+      if (geracao !== geracaoDia) return;
+      if (box) {
+        box.className = 'ssvh-resumo ssvh-alerta';
+        box.textContent = `Não foi possível carregar as vagas (${e.message}).`;
+      }
       warn('falha ao montar as vagas:', e);
     }
   }
@@ -1639,6 +1795,7 @@
       const ano = u.searchParams.get('ano');
       const tipoId = u.searchParams.get('tipo_atividade_agendamento_id');
       if (agendaId && dia && mes && ano) {
+        obterConfigAgenda(agendaId).catch(() => { /* tratado ao selecionar o dia */ });
         setTimeout(() => aoSelecionarDia({ agendaId, dia, mes, ano, tipoId }), 0);
       }
     } catch (_) { /* silencioso */ }
@@ -1656,5 +1813,9 @@
     return origFetch.apply(this, arguments);
   };
 
-  console.log(`[Vagas] v1.10.0 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', iniciarPrefetchConfig, { once: true });
+  } else iniciarPrefetchConfig();
+
+  console.log(`[Vagas] v1.11.0 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
 })();
