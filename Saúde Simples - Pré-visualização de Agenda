@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Saúde Simples - Pré-visualização de Agenda
 // @namespace    https://guarujahomolog.saudesimples.net/
-// @version      1.4.3
-// @description  Pré-visualização lateral em tempo real para criação e edição de agendas, corrigindo botão em agenda específica salva.
+// @version      1.5.0
+// @description  Pré-visualização lateral em tempo real para criação e edição de agendas, corrigindo botão em agenda específica salva. Na edição, mostra o último paciente agendado e (opcional) avisa conflito de período.
 // @author       otowm
 // @match        https://guarujahomolog.saudesimples.net/agendas/new*
 // @match        https://guarujahomolog.saudesimples.net/agendas/*/edit*
@@ -29,6 +29,9 @@
   const DISTRIBUIR_SOBRA_NOS_PRIMEIROS_HORARIOS = true;
 
   const DEBUG = false;
+  /** true = avisa (na caixa e na prévia) e pede confirmação ao salvar quando a edição conflita com paciente já agendado. */
+  const VALIDAR_CONFLITO_ULTIMO_AGENDADO = false;
+  const ULTIMO_AGENDADO_PREFIXO = '[UltimoAgendado]';
 
   const TIPOS_VAGA = {
     nova_consulta: {
@@ -94,6 +97,7 @@
   let calculadoraAberta = false;
   let livePollTimer = null;
   let lastPreviewSignature = '';
+  let ultimoAgendadoEstado = { status: 'carregando', data: null, rotulo: '' };
 
   const rerenderLive = debounce(() => {
     if (!contextoAtual) return;
@@ -158,6 +162,433 @@
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') closePopup();
   });
+
+  iniciarUltimoAgendado();
+
+  /**
+   * Conflitos com o último paciente agendado. Os atributos originais dos campos
+   * preservam o período salvo, mesmo quando o datepicker altera o valor atual.
+   */
+  function calcularConflitosUltimoAgendado() {
+    if (!VALIDAR_CONFLITO_ULTIMO_AGENDADO
+      || ultimoAgendadoEstado.status !== 'ok' || !ultimoAgendadoEstado.data) return [];
+
+    const agendaId = location.pathname.match(/\/agendas\/(\d+)\/edit\/?$/)?.[1];
+    const form = agendaId ? document.getElementById(`edit_agenda_${agendaId}`) : null;
+    if (!form) return [];
+
+    const conflitos = [];
+    const ultimaData = ultimoAgendadoEstado.data;
+    const ultimoRotulo = ultimoAgendadoEstado.rotulo;
+    const agora = new Date();
+    const hoje = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
+
+    findMapaPeriodoValidoKeys().forEach((key) => {
+      const prefixo = `agenda[agendas_mapas_periodos_validos_attributes][${key}]`;
+      const campos = getNamedFieldsByPrefix(prefixo).filter((el) => form.contains(el));
+      const inicial = findByName(campos, `${prefixo}[data_inicial]`);
+      const final = findByName(campos, `${prefixo}[data_final]`);
+      if (!periodoUltimoAgendadoExiste(inicial, form)) return;
+
+      const fim = parseDataUltimoAgendado(final?.value);
+      const fimOriginal = parseDataUltimoAgendado(final?.defaultValue);
+      const inicioOriginal = parseDataUltimoAgendado(inicial.defaultValue);
+      if (fim && fimOriginal && fim < fimOriginal && fim < ultimaData) {
+        const fimRotulo = formatarDataUltimoAgendado(fim);
+        conflitos.push({
+          kind: 'mapa_periodo_valido',
+          key,
+          mensagem: `Período já salvo (${inicial.value} a ${fimRotulo}): a data final foi antecipada de ${formatarDataUltimoAgendado(fimOriginal)} para ${fimRotulo}, mas há paciente agendado até ${ultimoRotulo}. Quem estiver agendado depois de ${fimRotulo} fica fora da agenda.`,
+        });
+      }
+
+      const inativo = findCheckboxByName(campos, `${prefixo}[inativo]`);
+      if (inativo?.checked && !inativo.defaultChecked && inicioOriginal && fimOriginal
+        && inicioOriginal <= ultimaData && fimOriginal >= hoje) {
+        conflitos.push({
+          kind: 'mapa_periodo_valido',
+          key,
+          mensagem: `Período já salvo (${formatarDataUltimoAgendado(inicioOriginal)} a ${formatarDataUltimoAgendado(fimOriginal)}) foi marcado como inativo, mas há paciente agendado até ${ultimoRotulo}.`,
+        });
+      }
+    });
+
+    // As chaves vêm dos mesmos campos usados pela prévia; não dependem da posição no DOM.
+    const novosPeriodos = new Map();
+    getAllNamedFields().forEach((el) => {
+      const key = extractMapaPeriodoKey(el.name);
+      if (key !== null && el.name.endsWith('[data_inicial]') && form.contains(el)) {
+        novosPeriodos.set(key, el);
+      }
+    });
+
+    novosPeriodos.forEach((inicial, key) => {
+      if (!periodoUltimoAgendadoExiste(inicial, form)) return;
+      const inicio = parseDataUltimoAgendado(inicial.value);
+      if (!inicio || inicio > ultimaData) return;
+
+      conflitos.push({
+        kind: 'mapa_periodo',
+        key,
+        mensagem: `Novo período começa em ${formatarDataUltimoAgendado(inicio)}, mas há paciente agendado até ${ultimoRotulo} na configuração atual. Comece o novo período a partir de ${formatarDataUltimoAgendado(somarDiasUltimoAgendado(ultimaData, 1))}.`,
+      });
+    });
+
+    return conflitos;
+  }
+
+  function periodoUltimoAgendadoExiste(campo, form) {
+    if (!campo || !form.contains(campo) || isMarkedForDestroy(campo)) return false;
+
+    // Um campo pode continuar no DOM quando a remoção apenas oculta o bloco .fields.
+    // Não usar isVisible aqui: os períodos ficam em abas (#tabs) e a aba fechada
+    // também está display:none, o que desligaria a validação ao salvar de outra aba.
+    for (let el = campo; el && el !== form; el = el.parentElement) {
+      if (el.hidden || (el.matches('.fields') && el.style.display === 'none')) return false;
+    }
+
+    return true;
+  }
+
+  function atualizarConflitosUltimoAgendado() {
+    if (!VALIDAR_CONFLITO_ULTIMO_AGENDADO) return;
+    const container = document.querySelector('#ssua-box .ssua-conflitos');
+    if (!container) return;
+
+    const conflitos = calcularConflitosUltimoAgendado();
+    container.replaceChildren(...conflitos.map((conflito) => {
+      const linha = document.createElement('div');
+      linha.textContent = `⚠ ${conflito.mensagem}`;
+      return linha;
+    }));
+    container.hidden = conflitos.length === 0;
+    if (contextoAtual) rerenderLive();
+  }
+
+  function parseDataUltimoAgendado(valor) {
+    const partes = String(valor || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (!partes) return null;
+    const [, dia, mes, ano] = partes.map(Number);
+    const data = new Date(ano, mes - 1, dia);
+    return data.getFullYear() === ano && data.getMonth() === mes - 1 && data.getDate() === dia
+      ? data : null;
+  }
+
+  function formatarDataUltimoAgendado(data) {
+    return `${String(data.getDate()).padStart(2, '0')}/${String(data.getMonth() + 1)
+      .padStart(2, '0')}/${data.getFullYear()}`;
+  }
+
+  function somarDiasUltimoAgendado(data, dias) {
+    return new Date(data.getFullYear(), data.getMonth(), data.getDate() + dias);
+  }
+
+  function iniciarUltimoAgendado() {
+    // O consultar_agendas só aceita até 90 dias entre data inicial e final, então
+    // a busca anda em janelas de diasPorJanela e para na primeira janela vazia.
+    const CONFIG = { anosAFrente: 3, diasPorJanela: 89, maxPaginasDia: 10, maxRequisicoes: 150 };
+    const PREFIXO = ULTIMO_AGENDADO_PREFIXO;
+    const agendaId = location.pathname.match(/\/agendas\/(\d+)\/edit\/?$/)?.[1];
+    if (!agendaId) return;
+    const form = document.querySelector(`#edit_agenda_${agendaId}`);
+    if (!form) return;
+
+    function normalizar(texto) {
+      return String(texto || '').normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toUpperCase();
+    }
+
+    function bloco(rotulo) {
+      return Array.from(form.querySelectorAll('div.grid_5, div.grid_6'))
+        .find((div) => div.querySelector('b')?.textContent.trim() === rotulo);
+    }
+
+    const unidadeId = document.querySelector('div.unidade_saude_id')?.textContent.trim() || '';
+    const profissionalNome = bloco('Profissional')?.querySelector('li')?.textContent.trim() || '';
+    let procedimentoId = '';
+    let procedimentoNome = '';
+    try {
+      const procedimento = JSON.parse(document.querySelector('#agenda_procedimento_token')
+        ?.getAttribute('data-pre') || '[]')[0];
+      procedimentoId = procedimento?.id ?? '';
+      procedimentoNome = procedimento?.nome || '';
+    } catch (erro) {
+      console.warn(PREFIXO, 'Procedimento indisponível; consultando por especialidade.', erro);
+    }
+    let profissionalId = '';
+    let requisicoes = 0;
+    let executando = false;
+
+    function numeroDia(data) {
+      return Date.UTC(data.getFullYear(), data.getMonth(), data.getDate()) / 86400000;
+    }
+
+    function montarUrl(ini, fim, page) {
+      const params = new URLSearchParams([
+        ['utf8', '✓'],
+        ['per_page', '100'],
+        ['filtro_consultar_agenda[data_inicial]', formatarDataUltimoAgendado(ini)],
+        ['filtro_consultar_agenda[data_final]', formatarDataUltimoAgendado(fim)],
+        ['filtro_consultar_agenda[modulo]', ''],
+        ['filtro_consultar_agenda[cancelados]', 'NÃO'],
+        ['filtro_consultar_agenda[situacao_id]', ''],
+        ['filtro_consultar_agenda[especifica]', ''],
+        ['filtro_consultar_agenda[prontuario]', ''],
+        ['filtro_consultar_agenda[unidade_saude_id]', unidadeId],
+        ['filtro_consultar_agenda[municipe_id]', ''],
+        ['filtro_consultar_agenda[profissional_id]', profissionalId],
+        ['filtro_consultar_agenda[ocupacao_id]', ''],
+        ['filtro_consultar_agenda[procedimento_id]', procedimentoId],
+        ['filtro_consultar_agenda[grupo_atendimento_id]', ''],
+        ['filtro_consultar_agenda[condicao_situacao_saude_id][]', ''],
+        ['consultar', ''],
+      ]);
+      if (page > 1) params.append('page', String(page));
+      return `/consultar_agendas?${params}`;
+    }
+
+    async function buscar(url, json = false) {
+      if (requisicoes >= CONFIG.maxRequisicoes) throw new Error('limite de consultas atingido');
+      requisicoes += 1;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      try {
+        const resposta = await fetch(url, {
+          credentials: 'same-origin',
+          signal: controller.signal,
+          ...(json ? { headers: { Accept: 'application/json' } } : {}),
+        });
+        if (!resposta.ok) {
+          throw new Error(`HTTP ${resposta.status} no ${json ? 'profissionais/search.json' : 'consultar_agendas'}`);
+        }
+        return await (json ? resposta.json() : resposta.text());
+      } catch (erro) {
+        if (erro.name === 'AbortError') throw new Error('tempo limite de 20 segundos excedido');
+        throw erro;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    async function resolverProfissional() {
+      try {
+        const resultados = await buscar(`/profissionais/search.json?q=${encodeURIComponent(profissionalNome)}`, true);
+        if (!Array.isArray(resultados)) return '';
+        return resultados.find((item) => normalizar(item.nome) === normalizar(profissionalNome))?.id ?? '';
+      } catch (erro) {
+        console.warn(PREFIXO, 'Não foi possível resolver o profissional; filtrando pelo nome.', erro);
+        return '';
+      }
+    }
+
+    function analisarPagina(html) {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      if (!doc.querySelector('.hastable table') && /90\s*dias/i.test(doc.body?.textContent || '')) {
+        throw new Error('o Consultar Agendas recusou o período (limite de 90 dias)');
+      }
+      const registros = [];
+      for (const tr of doc.querySelectorAll('.hastable table tbody tr')) {
+        const td = tr.querySelectorAll('td');
+        if (td.length < 15) continue;
+        function txt(i) {
+          return td[i].textContent.replace(/\s+/g, ' ').trim();
+        }
+        const registro = {
+          unidade: txt(0), profissional: txt(1), municipe: txt(2),
+          procedimento: txt(4), dataHora: txt(7), cancelado: txt(12), situacao: txt(13),
+        };
+        if (normalizar(registro.profissional) !== normalizar(profissionalNome)
+          || normalizar(registro.cancelado) === 'SIM') continue;
+        const partes = registro.dataHora.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+        if (!partes) continue;
+        const [, dia, mes, ano] = partes.map(Number);
+        const data = new Date(ano, mes - 1, dia);
+        if (data.getFullYear() !== ano || data.getMonth() !== mes - 1 || data.getDate() !== dia) continue;
+        const hora = registro.dataHora.match(/(\d{1,2}:\d{2})/)?.[1] || '';
+        const [horas, minutos] = hora ? hora.split(':').map(Number) : [0, 0];
+        registros.push({ ...registro, data, hora, ordem: numeroDia(data) * 1440 + horas * 60 + minutos });
+      }
+      return { registros, temMais: !!doc.querySelector('.pagination a.next_page') };
+    }
+
+    function maior(registros) {
+      return registros.reduce((max, item) => !max || item.ordem > max.ordem ? item : max, null);
+    }
+
+    async function maisRecente(ini, fim) {
+      const primeira = analisarPagina(await buscar(montarUrl(ini, fim, 1)));
+      if (!primeira.temMais) return maior(primeira.registros);
+      const dias = numeroDia(fim) - numeroDia(ini);
+      if (dias > 0) {
+        const meio = somarDiasUltimoAgendado(ini, Math.floor(dias / 2));
+        const recente = await maisRecente(somarDiasUltimoAgendado(meio, 1), fim);
+        return recente || maisRecente(ini, meio);
+      }
+      let resultado = maior(primeira.registros);
+      let temMais = primeira.temMais;
+      for (let page = 2; temMais && page <= CONFIG.maxPaginasDia; page += 1) {
+        const pagina = analisarPagina(await buscar(montarUrl(ini, fim, page)));
+        resultado = maior([resultado, ...pagina.registros].filter(Boolean));
+        temMais = pagina.temMais;
+      }
+      return resultado;
+    }
+
+    if (!document.getElementById('ssua-css')) {
+      const style = document.createElement('style');
+      style.id = 'ssua-css';
+      style.textContent = `
+        #ssua-box { clear: both; margin: 8px 0 12px; padding: 8px 12px; border: 1px solid #d5d5d5;
+          border-left: 4px solid #1a73e8; border-radius: 6px; background: #f7faff;
+          font: 13px/1.4 Arial, sans-serif; color: #333; display: flex; gap: 10px;
+          align-items: center; flex-wrap: wrap; }
+        #ssua-box .ssua-valor { color: #777; }
+        #ssua-box .ssua-valor strong { font-size: 14px; color: #333; }
+        #ssua-box a { color: #06c; }
+        #ssua-box button { border: none; background: none; cursor: pointer; font-size: 14px;
+          color: #666; margin-left: auto; }
+        #ssua-box .ssua-nota { font-size: 11px; color: #999; width: 100%; }
+        #ssua-box [hidden] { display: none; }
+      `;
+      if (VALIDAR_CONFLITO_ULTIMO_AGENDADO) {
+        style.textContent += `
+          #ssua-box .ssua-conflitos { width: 100%; color: #c00; font-size: 12px; margin-top: 4px; }
+        `;
+      }
+      document.head.append(style);
+    }
+    let box = document.getElementById('ssua-box');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'ssua-box';
+      const especialidade = bloco('Especialidade');
+      if (especialidade) {
+        const seguinte = especialidade.nextElementSibling;
+        const ancora = seguinte?.matches('div.clear') ? seguinte : especialidade;
+        ancora.after(box);
+      } else {
+        form.prepend(box);
+      }
+    }
+    const rotulo = document.createElement('b');
+    rotulo.textContent = 'Último paciente agendado:';
+    const valor = document.createElement('span');
+    valor.className = 'ssua-valor';
+    const link = document.createElement('a');
+    link.textContent = 'ver no Consultar Agendas ↗';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.hidden = true;
+    const botao = document.createElement('button');
+    botao.type = 'button';
+    botao.textContent = '↻';
+    botao.title = 'Consultar de novo';
+    const nota = document.createElement('span');
+    nota.className = 'ssua-nota';
+    nota.textContent = 'profissional filtrado pelo nome';
+    nota.hidden = true;
+    box.replaceChildren(rotulo, valor, link, botao, nota);
+
+    if (VALIDAR_CONFLITO_ULTIMO_AGENDADO) {
+      const conflitos = document.createElement('div');
+      conflitos.className = 'ssua-conflitos';
+      conflitos.hidden = true;
+      box.appendChild(conflitos);
+
+      const atualizarAposEdicao = debounce(atualizarConflitosUltimoAgendado, 200);
+      function aoEditarPeriodo(ev) {
+        if (isPreviewUiElement(ev.target)) return;
+        atualizarAposEdicao();
+      }
+
+      // O datepicker do jQuery muda o valor sem disparar change nativo: click e
+      // focusout pegam a escolha no calendário e a saída do campo.
+      ['input', 'change', 'click', 'focusout'].forEach((tipo) => {
+        document.addEventListener(tipo, aoEditarPeriodo, true);
+      });
+
+      // No window, a confirmação vem antes do rails-ujs desabilitar o botão Salvar.
+      window.addEventListener('submit', function confirmarConflitos(ev) {
+        if (ev.target !== form) return;
+        if (ultimoAgendadoEstado.status !== 'ok') {
+          console.warn(PREFIXO, 'Consulta do último agendado indisponível; salvando sem validar conflitos.',
+            ultimoAgendadoEstado.status);
+          return;
+        }
+
+        const linhas = calcularConflitosUltimoAgendado().map((conflito) => conflito.mensagem);
+        if (!linhas.length) return;
+
+        const confirmado = window.confirm('Conflito com paciente agendado:\n\n'
+          + linhas.map((linha) => '• ' + linha).join('\n') + '\n\nSalvar mesmo assim?');
+        if (!confirmado) {
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+        }
+      }, true);
+    }
+
+    async function consultar() {
+      if (executando) return;
+      executando = true;
+      ultimoAgendadoEstado = { status: 'carregando', data: null, rotulo: '' };
+      if (VALIDAR_CONFLITO_ULTIMO_AGENDADO) atualizarConflitosUltimoAgendado();
+      botao.disabled = true;
+      requisicoes = 0;
+      valor.textContent = 'consultando…';
+      valor.style.color = '#777';
+      link.hidden = true;
+      nota.hidden = true;
+      try {
+        if (!unidadeId || !profissionalNome) throw new Error('unidade ou profissional não encontrado na agenda');
+        profissionalId = await resolverProfissional();
+        nota.hidden = profissionalId !== '';
+        const agora = new Date();
+        const hoje = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
+        const limite = new Date(hoje.getTime());
+        limite.setFullYear(limite.getFullYear() + CONFIG.anosAFrente);
+        console.info(PREFIXO, 'Consultando agenda', agendaId, procedimentoNome);
+        let resultado = null;
+        for (let ini = hoje; ini <= limite; ini = somarDiasUltimoAgendado(ini, CONFIG.diasPorJanela + 1)) {
+          const fimJanela = somarDiasUltimoAgendado(ini, CONFIG.diasPorJanela);
+          const fim = fimJanela < limite ? fimJanela : limite;
+          valor.textContent = `consultando até ${formatarDataUltimoAgendado(fim)}…`;
+          const daJanela = await maisRecente(ini, fim);
+          if (!daJanela) break;
+          resultado = daJanela;
+        }
+        if (resultado) {
+          const data = document.createElement('strong');
+          data.textContent = formatarDataUltimoAgendado(resultado.data);
+          valor.style.color = '#555';
+          valor.replaceChildren(data, document.createTextNode(
+            `${resultado.hora ? ` às ${resultado.hora}` : ''} — ${resultado.municipe}`));
+          link.href = montarUrl(resultado.data, resultado.data, 1);
+          link.hidden = false;
+        } else {
+          valor.textContent = 'nenhum agendamento a partir de hoje';
+        }
+        ultimoAgendadoEstado = {
+          status: 'ok',
+          data: resultado ? resultado.data : null,
+          rotulo: resultado ? formatarDataUltimoAgendado(resultado.data) : '',
+        };
+        console.info(PREFIXO, 'Consulta concluída', { requisicoes, resultado });
+      } catch (erro) {
+        ultimoAgendadoEstado = { status: 'erro', data: null, rotulo: '' };
+        valor.textContent = `erro: ${erro.message}`;
+        valor.style.color = '#c00';
+        console.error(PREFIXO, erro);
+      } finally {
+        executando = false;
+        botao.disabled = false;
+        if (VALIDAR_CONFLITO_ULTIMO_AGENDADO) atualizarConflitosUltimoAgendado();
+      }
+    }
+
+    botao.addEventListener('click', consultar);
+    void consultar();
+  }
 
   function attachPreviewButtons() {
     const mapaCheckboxConfigs = findMapaPeriodoDistribuidoCheckboxes().map((checkbox) => ({
@@ -1421,6 +1852,19 @@
       }
     });
 
+    if (VALIDAR_CONFLITO_ULTIMO_AGENDADO) {
+      calcularConflitosUltimoAgendado().forEach((conflito) => {
+        if (conflito.kind !== data.kind || conflito.key !== data.key) return;
+
+        warnings.push({
+          type: 'error',
+          diaLabel: '',
+          title: 'Conflito com paciente agendado',
+          message: conflito.mensagem,
+        });
+      });
+    }
+
     return warnings;
   }
 
@@ -1961,6 +2405,7 @@
     return Boolean(
       target.closest('#ss-agenda-preview-side-panel')
       || target.closest('#ss-agenda-preview-overlay')
+      || target.closest('#ssua-box')
     );
   }
 
