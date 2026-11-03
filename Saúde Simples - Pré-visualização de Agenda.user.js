@@ -4,6 +4,8 @@
 // @version      1.5.0
 // @description  Pré-visualização lateral em tempo real para criação e edição de agendas, corrigindo botão em agenda específica salva. Na edição, mostra o último paciente agendado e (opcional) avisa conflito de período.
 // @author       otowm
+// @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20Pr%C3%A9-visualiza%C3%A7%C3%A3o%20de%20Agenda.user.js
+// @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20Pr%C3%A9-visualiza%C3%A7%C3%A3o%20de%20Agenda.user.js
 // @match        https://guarujahomolog.saudesimples.net/agendas/new*
 // @match        https://guarujahomolog.saudesimples.net/agendas/*/edit*
 // @match        https://guaruja.saudesimples.net/agendas/new*
