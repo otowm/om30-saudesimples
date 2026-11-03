@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name Saúde Simples - Último agendado da agenda
 // @namespace om30.saudesimples.guaruja
-// @version 1.0.0
+// @version 1.1.0
 // @description Na edição da agenda, consulta o Consultar Agendas e mostra a data do paciente agendado mais distante.
 // @downloadURL https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20%C3%9Altimo%20agendado%20da%20agenda.user.js
 // @updateURL https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Sa%C3%BAde%20Simples%20-%20%C3%9Altimo%20agendado%20da%20agenda.user.js
@@ -15,7 +15,9 @@
 (function () {
   'use strict';
 
-  const CONFIG = { anosAFrente: 3, maxPaginasDia: 10, maxRequisicoes: 150 };
+  // O consultar_agendas só aceita até 90 dias entre data inicial e final, então
+  // a busca anda em janelas de diasPorJanela e para na primeira janela vazia.
+  const CONFIG = { anosAFrente: 3, diasPorJanela: 89, maxPaginasDia: 10, maxRequisicoes: 150 };
   const PREFIXO = '[UltimoAgendado]';
   const agendaId = location.pathname.match(/\/agendas\/(\d+)\/edit\/?$/)?.[1];
   if (!agendaId) return;
@@ -115,6 +117,9 @@
 
   function analisarPagina(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
+    if (!doc.querySelector('.hastable table') && /90\s*dias/i.test(doc.body?.textContent || '')) {
+      throw new Error('o Consultar Agendas recusou o período (limite de 90 dias)');
+    }
     const registros = [];
     for (const tr of doc.querySelectorAll('.hastable table tbody tr')) {
       const td = tr.querySelectorAll('td');
@@ -224,10 +229,18 @@
       nota.hidden = profissionalId !== '';
       const agora = new Date();
       const hoje = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
-      const fim = new Date(hoje.getTime());
-      fim.setFullYear(fim.getFullYear() + CONFIG.anosAFrente);
+      const limite = new Date(hoje.getTime());
+      limite.setFullYear(limite.getFullYear() + CONFIG.anosAFrente);
       console.info(PREFIXO, 'Consultando agenda', agendaId, procedimentoNome);
-      const resultado = await maisRecente(hoje, fim);
+      let resultado = null;
+      for (let ini = hoje; ini <= limite; ini = somarDias(ini, CONFIG.diasPorJanela + 1)) {
+        const fimJanela = somarDias(ini, CONFIG.diasPorJanela);
+        const fim = fimJanela < limite ? fimJanela : limite;
+        valor.textContent = `consultando até ${formatarData(fim)}…`;
+        const daJanela = await maisRecente(ini, fim);
+        if (!daJanela) break;
+        resultado = daJanela;
+      }
       if (resultado) {
         const data = document.createElement('strong');
         data.textContent = formatarData(resultado.data);
