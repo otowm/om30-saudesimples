@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.11.0
+// @version      1.12.0
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma e quantas estão livres.
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/agendamentos*
@@ -680,13 +680,21 @@
     return mapa;
   }
 
-  function horariosDosPeriodos(config, ts, diaSemana) {
-    const out = [];
+  // Com períodos sobrepostos o Saúde Simples não soma: vale só o de Data Inicial
+  // mais recente (empate: o último listado). Confirmado no relatório
+  // agendamento_vaga — agenda 4154 em 05/11/2026 mostra 18, não 24+18.
+  function periodoNaData(config, ts) {
+    let escolhido = null;
     config.periodos.forEach((p) => {
       if (ts < p.inicioTs || ts > p.fimTs) return;
-      p.horarios.forEach((h) => { if (h.diaSemana === diaSemana) out.push(h); });
+      if (!escolhido || p.inicioTs >= escolhido.inicioTs) escolhido = p;
     });
-    return out;
+    return escolhido;
+  }
+
+  function horariosDosPeriodos(config, ts, diaSemana) {
+    const p = periodoNaData(config, ts);
+    return p ? p.horarios.filter((h) => h.diaSemana === diaSemana) : [];
   }
 
   function bloqueiosNaData(config, dataObj) {
@@ -1744,10 +1752,10 @@
         const configuradas = vagasConfiguradasNaData(config, dataObj);
 
         const tsData = soDia(dataObj);
-        const periodosValendo = config.periodos.filter((p) => tsData >= p.inicioTs && tsData <= p.fimTs
-          && p.horarios.some((h) => h.diaSemana === dataObj.getDay()));
-        if (periodosValendo.length > 1) {
-          avisosPintura.push(`Atenção: ${periodosValendo.length} períodos sobrepostos valem para esta data — as vagas configuradas estão somadas.`);
+        const periodosCobrindo = config.periodos.filter((p) => tsData >= p.inicioTs && tsData <= p.fimTs);
+        if (periodosCobrindo.length > 1) {
+          const usado = periodoNaData(config, tsData);
+          avisosPintura.push(`${periodosCobrindo.length} períodos cobrem esta data — vale só o mais recente (${usado.dataInicial} a ${usado.dataFinal}).`);
         }
 
         if (!configuradas.size) {
