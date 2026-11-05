@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.15.0
+// @version      1.15.1
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
@@ -940,53 +940,25 @@
     }
   }
 
-  // Lê o CPF direto do cadastro pelo id (formulário de "Editar Munícipe").
-  // null quando a página não trouxe o campo (sem permissão, login, layout novo).
-  async function cpfPeloId(municipeId) {
-    const resp = await fetchComTimeout(`/municipes/${encodeURIComponent(municipeId)}/edit`, { credentials: 'same-origin' });
-    if (!resp.ok) return null;
-    const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
-    const campos = [...doc.querySelectorAll('input')].filter((i) => {
-      const nome = `${i.name || ''} ${i.id || ''}`;
-      return /cpf/i.test(nome) && !/cnpj|respons|mae|pai|conjuge/i.test(nome) && i.type !== 'hidden';
-    });
-    const campo = campos.find((i) => /municipe\[cpf(_numero)?\]/.test(i.name || '')) || campos[0];
-    if (!campo) return null;
-    const cpf = String(campo.value || '').replace(/\D/g, '');
-    if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
-    return /^\d{11}$/.test(cpf)
-      ? { cpf: cpf.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4') }
-      : { cpf: '', motivo: 'CPF inválido no cadastro' };
-  }
-
   async function buscarCpf(o) {
     if (!CONFIG.mostrarCpf) return { cpf: '', motivo: 'consulta de CPF desativada' };
     const temCns = /^\d{15}$/.test(o.cns || '');
-    if (!o.municipeId && !temCns && !buscaPorNome(o)) return escolherMunicipe([], o);
-    // Com o id (quadro do munícipe) o CPF vem do próprio cadastro; a busca
-    // fica de reserva. "nome dd/mm/aaaa" bate no campo nome_data_nascimento;
-    // o nome sozinho fica de reserva caso a busca não aceite a data.
-    const termos = temCns ? [o.cns] : (buscaPorNome(o) ? [`${o.nome} ${o.nascimento}`, o.nome] : []);
-    const chave = o.municipeId
-      ? `id:${o.municipeId}`
-      : temCns
-        ? o.cns
-        : `${normalizar(o.nome)}|${o.nascimento}|${normalizar(o.mae)}`;
+    if (!temCns && !buscaPorNome(o)) return escolherMunicipe([], o);
+    // O id do munícipe não tem rota acessível daqui (o cadastro fica no v3, com
+    // token próprio); ele só confere o resultado da busca.
+    // "nome dd/mm/aaaa" bate no campo nome_data_nascimento; o nome sozinho fica
+    // de reserva caso a busca não aceite a data.
+    const termos = temCns ? [o.cns] : [`${o.nome} ${o.nascimento}`, o.nome];
+    const chave = temCns
+      ? `${o.cns}|${o.municipeId || ''}`
+      : `${normalizar(o.nome)}|${o.nascimento}|${normalizar(o.mae)}|${o.municipeId || ''}`;
     const agora = Date.now();
     const cache = cacheCpf.get(chave);
     if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
 
     const promise = new Promise((resolve, reject) => {
       filaCpf.push({ resolve, reject, executar: async () => {
-        if (o.municipeId) {
-          const peloId = await cpfPeloId(o.municipeId).catch((e) => {
-            warn('Falha ao ler o CPF pelo id:', e);
-            return null;
-          });
-          if (peloId) return peloId;
-          log('CPF pelo id indisponível, usando a busca', o.municipeId);
-        }
-        let resultado = escolherMunicipe([], o);
+        let resultado;
         for (const termo of termos) {
           const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(termo)}`, {
             credentials: 'same-origin',
