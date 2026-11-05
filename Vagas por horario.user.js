@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.12.0
-// @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma e quantas estão livres.
+// @version      1.16.0
+// @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/agendamentos*
 // @match        https://guarujahomolog.saudesimples.net/agendamentos*
@@ -32,6 +32,8 @@
     debounceMs: 400,
     esperaTabelaMs: 12000, // quanto tempo esperar a tabela de horários aparecer
     ttlCacheMs: 60000,     // cache do consultar_agendas por data/profissional
+
+    mostrarCpf: true,    // consulta o CPF ao abrir os agendados ou a agenda do dia
 
     debug: false,
   };
@@ -820,6 +822,7 @@
     const iHora = indiceCabecalho(ths, 'hora|horario');
     const iPaciente = indiceCabecalho(ths, 'paciente|municipe|nome');
     const iPront = indiceCabecalho(ths, 'pront');
+    const iCns = indiceCabecalho(ths, 'sus|cns');
     const iProc = indiceCabecalho(ths, 'procedimento');
     const iSit = indiceCabecalho(ths, 'situacao|status');
     const iTipo = indiceCabecalho(ths, 'tipo de consulta|tipo de vaga|tipo vaga|tipo');
@@ -839,8 +842,10 @@
       const mHora = hora.match(/(\d{1,2})\s*[:h]\s*(\d{2})/);
       if (!mHora) return;
 
+      const cns = txt(iCns).replace(/\D/g, '');
       linhas.push({
         hora: `${pad2(mHora[1])}:${mHora[2]}`,
+        cns: /^\d{15}$/.test(cns) ? cns : '',
         paciente: txt(iPaciente),
         prontuario: txt(iPront),
         procedimento: txt(iProc),
@@ -888,6 +893,195 @@
     cacheAtendimentos.set(chave, { ts: agora, promise });
     promise.catch(() => cacheAtendimentos.delete(chave));
     return promise;
+  }
+
+  /* ============================== CPF do paciente ============================== */
+
+  const cacheCpf = new Map(); // chave -> { ts, promise }
+  const filaCpf = [];
+  let consultasCpfAtivas = 0;
+
+  // Só com o CNS totalmente vazio (quadro do munícipe): busca por nome e data
+  // de nascimento e confirma pelo nome da mãe.
+  const buscaPorNome = (o) => !!(o.cnsVazio && o.nome && o.nascimento && o.mae);
+
+  function escolherMunicipe(lista, o) {
+    const temCns = /^\d{15}$/.test(o.cns || '');
+    if (!temCns && !buscaPorNome(o)) {
+      return { cpf: '', motivo: o.cnsVazio ? 'sem CNS e sem nome, nascimento e mãe para conferir' : 'sem CNS na listagem' };
+    }
+    let candidatos = lista.filter((m) => (temCns
+      ? String(m.codigo_cns || '').replace(/\D/g, '') === o.cns && (!o.municipeId || String(m.id) === o.municipeId)
+      : normalizar(m.nome) === normalizar(o.nome)
+        && m.data_nascimento_formatada === o.nascimento
+        && normalizar(m.nome_mae) === normalizar(o.mae)));
+    // Cadastro duplicado (mesmo nome, nascimento e mãe): fica o que está aberto.
+    if (candidatos.length > 1 && o.municipeId) candidatos = candidatos.filter((m) => String(m.id) === o.municipeId);
+    if (candidatos.length !== 1) {
+      return { cpf: '', motivo: temCns ? 'cadastro não encontrado pelo CNS' : 'cadastro não encontrado por nome, nascimento e mãe' };
+    }
+    const cpf = String(candidatos[0].cpf_numero || '').replace(/\D/g, '');
+    if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
+    return /^\d{11}$/.test(cpf)
+      ? { cpf: cpf.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4') }
+      : { cpf: '', motivo: 'CPF inválido no cadastro' };
+  }
+
+  function executarFilaCpf() {
+    while (consultasCpfAtivas < 4 && filaCpf.length) {
+      const { executar, resolve, reject } = filaCpf.shift();
+      consultasCpfAtivas += 1;
+      Promise.resolve().then(executar).then(resolve, reject).finally(() => {
+        consultasCpfAtivas -= 1;
+        executarFilaCpf();
+      });
+    }
+  }
+
+  async function buscarCpf(o) {
+    if (!CONFIG.mostrarCpf) return { cpf: '', motivo: 'consulta de CPF desativada' };
+    const temCns = /^\d{15}$/.test(o.cns || '');
+    if (!temCns && !buscaPorNome(o)) return escolherMunicipe([], o);
+    // O id do munícipe não tem rota acessível daqui (o cadastro fica no v3, com
+    // token próprio); ele só confere o resultado da busca.
+    // "nome dd/mm/aaaa" bate no campo nome_data_nascimento; o nome sozinho fica
+    // de reserva caso a busca não aceite a data.
+    const termos = temCns ? [o.cns] : [`${o.nome} ${o.nascimento}`, o.nome];
+    const chave = temCns
+      ? `${o.cns}|${o.municipeId || ''}`
+      : `${normalizar(o.nome)}|${o.nascimento}|${normalizar(o.mae)}|${o.municipeId || ''}`;
+    const agora = Date.now();
+    const cache = cacheCpf.get(chave);
+    if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
+
+    const promise = new Promise((resolve, reject) => {
+      filaCpf.push({ resolve, reject, executar: async () => {
+        let resultado;
+        for (const termo of termos) {
+          const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(termo)}`, {
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status} na consulta de CPF`);
+          const lista = JSON.parse(await resp.text());
+          if (!Array.isArray(lista)) throw new Error('resposta inválida na consulta de CPF');
+          resultado = escolherMunicipe(lista, o);
+          if (resultado.cpf || resultado.semCpf) break;
+        }
+        return resultado;
+      } });
+      executarFilaCpf();
+    }).catch((e) => {
+      if (cacheCpf.get(chave)?.promise === promise) cacheCpf.delete(chave);
+      warn('Falha ao buscar CPF:', e);
+      return { cpf: '', motivo: 'paciente não identificado: falha na consulta de CPF' };
+    });
+
+    cacheCpf.set(chave, { ts: agora, promise });
+    return promise;
+  }
+
+  function marcadorCpf(o, pacientesCpf, tag = 'span') {
+    if (!CONFIG.mostrarCpf) return '';
+    const indice = pacientesCpf.push(o) - 1;
+    return `<${tag} class="ssvh-det" data-ssvh-cpf="${esc(indice)}">${tag === 'span' ? '· CPF ' : ''}…</${tag}>`;
+  }
+
+  function preencherCpfs(container, pacientesCpf) {
+    if (!CONFIG.mostrarCpf) return;
+    container.querySelectorAll('[data-ssvh-cpf]').forEach((el) => {
+      buscarCpf(pacientesCpf[Number(el.dataset.ssvhCpf)]).then(({ cpf, semCpf, motivo }) => {
+        if (!el.isConnected) return;
+        el.textContent = (el.tagName === 'SPAN' ? '· CPF ' : '') + (semCpf ? '' : (cpf || '—'));
+        if (semCpf) {
+          const badge = document.createElement('span');
+          badge.className = 'ssvh-sem-cpf';
+          badge.textContent = 'SEM CPF';
+          badge.title = motivo;
+          el.appendChild(badge);
+        }
+        if (!cpf) el.title = motivo;
+      });
+    });
+  }
+
+  /* ================ CPF no quadro "Informações do Munícipe" ================ */
+
+  // O quadro mostra o CNS; o CPF vem da busca pelo CNS, conferindo que é o
+  // mesmo cadastro (mesmo id). Há duas variantes do quadro: com "Número de
+  // Prontuário" editável (id num input oculto dentro dele) e sem (id fora do
+  // quadro, blocos dentro de um div.form) — o link "Editar Munícipe" vale nas duas.
+  function localizarQuadroMunicipe() {
+    const cabecalho = [...document.querySelectorAll('.content-box .ui-box-header')]
+      .find((h) => normalizar(h.textContent).includes('INFORMACOES DO MUNICIPE'));
+    return cabecalho ? cabecalho.closest('.content-box').querySelector('.content-box-wrapper') : null;
+  }
+
+  function inserirCpfNoQuadro() {
+    if (!CONFIG.mostrarCpf) return;
+    const quadro = localizarQuadroMunicipe();
+    if (!quadro) return;
+    const linkEditar = quadro.closest('.content-box').querySelector('a[href*="/municipes/"][href*="/edit"]');
+    const municipeId = String(document.getElementById('agendamento_municipe_id')?.value
+      || linkEditar?.getAttribute('href').match(/\/municipes\/(\d+)\/edit/)?.[1] || '').trim();
+    const existente = quadro.querySelector('.ssvh-cpf-quadro');
+    if (existente) {
+      if (existente.dataset.municipeId === municipeId) return;
+      // Outro munícipe no mesmo quadro: devolve o cartão provisório ao lugar.
+      const movido = quadro.querySelector('.ssvh-cpf-movido');
+      if (movido) {
+        movido.classList.remove('ssvh-cpf-movido');
+        existente.replaceWith(movido);
+      } else existente.remove();
+      quadro.querySelectorAll('.ssvh-cpf-clear').forEach((el) => el.remove());
+    }
+
+    const blocos = [...quadro.querySelectorAll('div[class*="grid_"]')].filter((d) => d.querySelector('strong'));
+    const blocoDe = (rotulo) => blocos.find((d) => normalizar(d.querySelector('strong')?.textContent) === rotulo);
+    const blocoCns = blocoDe('CODIGO CNS');
+    const cns = (blocoCns?.querySelectorAll('li')[1]?.textContent || '').replace(/\D/g, '');
+    const valorDe = (rotulo) => (blocoDe(rotulo)?.querySelectorAll('li')[1]?.textContent || '').replace(/\s+/g, ' ').trim();
+    const nome = valorDe('NOME');
+    const nascimento = (valorDe('DATA DE NASCIMENTO').match(/\d{2}\/\d{2}\/\d{4}/) || [''])[0];
+    const mae = valorDe('NOME DA MAE');
+    const ancora = blocoDe('NOME DA MAE') || blocoDe('DATA DE NASCIMENTO');
+    if (!ancora) return;
+
+    // O CPF fica no lugar do cartão provisório (1ª linha, ao lado do CNS) e o
+    // cartão provisório desce para uma linha própria na coluna da esquerda,
+    // depois do nome da mãe: a direita pode ter o cartão de lembrete.
+    injetarCss();
+    const provisorio = blocoDe('CARTAO PROVISORIO');
+    const bloco = document.createElement('div');
+    bloco.dataset.municipeId = municipeId;
+    bloco.innerHTML = '<li><strong>CPF</strong></li><li data-ssvh-cpf="0">…</li>';
+    let paraLinha = bloco;
+    if (provisorio) {
+      bloco.className = `${provisorio.className} ssvh-cpf-quadro`;
+      provisorio.replaceWith(bloco);
+      provisorio.classList.add('ssvh-cpf-movido');
+      paraLinha = provisorio;
+    } else bloco.className = 'grid_4 ssvh-cpf-quadro';
+    const limpar = document.createElement('div');
+    limpar.className = 'clear ssvh-cpf-clear';
+    const depoisDe = ancora.nextElementSibling?.classList.contains('clear') ? ancora.nextElementSibling : ancora;
+    depoisDe.after(paraLinha, limpar);
+    if (depoisDe === ancora) paraLinha.before(Object.assign(document.createElement('div'), { className: 'clear ssvh-cpf-clear' }));
+    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', cnsVazio: !cns, municipeId, nome, nascimento, mae }]);
+  }
+
+  function observarQuadroMunicipe() {
+    let agendado = false;
+    const verificar = () => {
+      agendado = false;
+      inserirCpfNoQuadro();
+    };
+    new MutationObserver(() => {
+      if (agendado) return;
+      agendado = true;
+      requestAnimationFrame(verificar);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+    verificar();
   }
 
   /* ====================== Localização da tabela de horários ====================== */
@@ -1006,6 +1200,11 @@
         font: bold 10px/16px Arial, sans-serif; white-space: nowrap; vertical-align: middle;
       }
       .ssvh-livre  { background: #e6f4ea; color: #1a7f37; border: 1px solid #b7dfc4; }
+      .ssvh-sem-cpf {
+        display: inline-block; padding: 1px 6px; border-radius: 8px;
+        font: bold 10px/16px Arial, sans-serif; white-space: nowrap;
+        background: #fdecea; color: #b3261e; border: 1px solid #f3b8b2;
+      }
       .ssvh-cheio  { background: #fdecea; color: #b3261e; border: 1px solid #f3b8b2; }
       .ssvh-parcial{ background: #fff4e5; color: #8a5300; border: 1px solid #f0d0a0; }
       .ssvh-neutro { background: #eee; color: #555; border: 1px solid #ddd; }
@@ -1387,6 +1586,7 @@
     fecharPainel();
     injetarCss();
 
+    const pacientesCpf = [];
     const horas = [...new Set([...configuradas.keys(), ...detalhesPorHora.keys()])].sort();
     const tipos = ORDEM_DISTRIBUIDO.filter((t) => {
       const temConfig = [...configuradas.values()].some((v) => (v.porTipo[t] || 0) > 0);
@@ -1418,7 +1618,8 @@
       const nomes = agendados.length
         ? agendados.map((o) => `${esc(o.paciente || '(sem nome)')}`
             + (o.tipoVaga ? ` <span class="ssvh-det">(${esc(o.tipoVaga)})</span>` : '')
-            + (o.prontuario ? ` <span class="ssvh-det">· pront. ${esc(o.prontuario)}</span>` : ''))
+            + (o.prontuario ? ` <span class="ssvh-det">· pront. ${esc(o.prontuario)}</span>` : '')
+            + (CONFIG.mostrarCpf ? ` ${marcadorCpf(o, pacientesCpf)}` : ''))
           .join('<br>')
         : '<span class="ssvh-vazio">—</span>';
 
@@ -1469,6 +1670,7 @@
     pop.querySelector('.ssvh-pop-fechar').addEventListener('click', fecharPainel);
     document.body.appendChild(pop);
     painelAtual = pop;
+    preencherCpfs(pop, pacientesCpf);
     document.addEventListener('keydown', aoTeclarPainel, true);
   }
 
@@ -1512,12 +1714,14 @@
     fecharPopover();
     injetarCss();
 
+    const pacientesCpf = [];
     const tabelaDe = (lista) => {
       const temColunaTipo = lista.some((o) => o.tipoVaga);
       const linhas = lista.map((o) => `
         <tr>
           <td>${esc(o.paciente || '(sem nome)')}</td>
           <td>${esc(o.prontuario || '—')}</td>
+          ${marcadorCpf(o, pacientesCpf, 'td')}
           ${temColunaTipo ? `<td>${esc(o.tipoVaga || '—')}</td>` : ''}
           <td>${esc(o.procedimento || '—')}</td>
           <td>${esc(o.situacao || '—')}</td>
@@ -1526,7 +1730,7 @@
         <table>
           <thead>
             <tr>
-              <th>Paciente</th><th>Prontuário</th>
+              <th>Paciente</th><th>Prontuário</th>${CONFIG.mostrarCpf ? '<th>CPF</th>' : ''}
               ${temColunaTipo ? '<th>Tipo de consulta</th>' : ''}
               <th>Procedimento</th><th>Situação</th>
             </tr>
@@ -1570,6 +1774,7 @@
 
     posicionarPopover(pop, ancora);
     popoverAtual = pop;
+    preencherCpfs(pop, pacientesCpf);
     // capture=true para fechar antes que o site trate o clique
     setTimeout(() => {
       document.addEventListener('click', aoClicarFora, true);
@@ -1823,7 +2028,12 @@
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', iniciarPrefetchConfig, { once: true });
-  } else iniciarPrefetchConfig();
+    document.addEventListener('DOMContentLoaded', observarQuadroMunicipe, { once: true });
+  } else {
+    iniciarPrefetchConfig();
+    observarQuadroMunicipe();
+  }
 
-  console.log(`[Vagas] v1.11.0 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
+  const versao = typeof GM_info !== 'undefined' ? GM_info.script.version : '?';
+  console.log(`[Vagas] v${versao} ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
 })();
