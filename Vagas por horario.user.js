@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.14.1
+// @version      1.15.0
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
@@ -903,15 +903,24 @@
   const filaCpf = [];
   let consultasCpfAtivas = 0;
 
+  // Só com o CNS totalmente vazio (quadro do munícipe): busca por nome e data
+  // de nascimento e confirma pelo nome da mãe.
+  const buscaPorNome = (o) => !!(o.cnsVazio && o.nome && o.nascimento && o.mae);
+
   function escolherMunicipe(lista, o) {
     const temCns = /^\d{15}$/.test(o.cns || '');
-    // Sem CNS, só o quadro do munícipe tem como conferir: pelo id do cadastro aberto.
-    if (!temCns && !(o.municipeId && o.nome)) return { cpf: '', motivo: 'sem CNS na listagem' };
-    const candidatos = lista.filter((m) => (temCns
+    if (!temCns && !buscaPorNome(o)) {
+      return { cpf: '', motivo: o.cnsVazio ? 'sem CNS e sem nome, nascimento e mãe para conferir' : 'sem CNS na listagem' };
+    }
+    let candidatos = lista.filter((m) => (temCns
       ? String(m.codigo_cns || '').replace(/\D/g, '') === o.cns && (!o.municipeId || String(m.id) === o.municipeId)
-      : String(m.id) === o.municipeId));
+      : normalizar(m.nome) === normalizar(o.nome)
+        && m.data_nascimento_formatada === o.nascimento
+        && normalizar(m.nome_mae) === normalizar(o.mae)));
+    // Cadastro duplicado (mesmo nome, nascimento e mãe): fica o que está aberto.
+    if (candidatos.length > 1 && o.municipeId) candidatos = candidatos.filter((m) => String(m.id) === o.municipeId);
     if (candidatos.length !== 1) {
-      return { cpf: '', motivo: temCns ? 'cadastro não encontrado pelo CNS' : 'cadastro não encontrado pelo nome' };
+      return { cpf: '', motivo: temCns ? 'cadastro não encontrado pelo CNS' : 'cadastro não encontrado por nome, nascimento e mãe' };
     }
     const cpf = String(candidatos[0].cpf_numero || '').replace(/\D/g, '');
     if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
@@ -931,26 +940,65 @@
     }
   }
 
+  // Lê o CPF direto do cadastro pelo id (formulário de "Editar Munícipe").
+  // null quando a página não trouxe o campo (sem permissão, login, layout novo).
+  async function cpfPeloId(municipeId) {
+    const resp = await fetchComTimeout(`/municipes/${encodeURIComponent(municipeId)}/edit`, { credentials: 'same-origin' });
+    if (!resp.ok) return null;
+    const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+    const campos = [...doc.querySelectorAll('input')].filter((i) => {
+      const nome = `${i.name || ''} ${i.id || ''}`;
+      return /cpf/i.test(nome) && !/cnpj|respons|mae|pai|conjuge/i.test(nome) && i.type !== 'hidden';
+    });
+    const campo = campos.find((i) => /municipe\[cpf(_numero)?\]/.test(i.name || '')) || campos[0];
+    if (!campo) return null;
+    const cpf = String(campo.value || '').replace(/\D/g, '');
+    if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
+    return /^\d{11}$/.test(cpf)
+      ? { cpf: cpf.replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4') }
+      : { cpf: '', motivo: 'CPF inválido no cadastro' };
+  }
+
   async function buscarCpf(o) {
     if (!CONFIG.mostrarCpf) return { cpf: '', motivo: 'consulta de CPF desativada' };
     const temCns = /^\d{15}$/.test(o.cns || '');
-    if (!temCns && !(o.municipeId && o.nome)) return escolherMunicipe([], o);
-    const termo = temCns ? o.cns : o.nome;
-    const chave = `${temCns ? o.cns : normalizar(o.nome)}|${o.municipeId || ''}`;
+    if (!o.municipeId && !temCns && !buscaPorNome(o)) return escolherMunicipe([], o);
+    // Com o id (quadro do munícipe) o CPF vem do próprio cadastro; a busca
+    // fica de reserva. "nome dd/mm/aaaa" bate no campo nome_data_nascimento;
+    // o nome sozinho fica de reserva caso a busca não aceite a data.
+    const termos = temCns ? [o.cns] : (buscaPorNome(o) ? [`${o.nome} ${o.nascimento}`, o.nome] : []);
+    const chave = o.municipeId
+      ? `id:${o.municipeId}`
+      : temCns
+        ? o.cns
+        : `${normalizar(o.nome)}|${o.nascimento}|${normalizar(o.mae)}`;
     const agora = Date.now();
     const cache = cacheCpf.get(chave);
     if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
 
     const promise = new Promise((resolve, reject) => {
       filaCpf.push({ resolve, reject, executar: async () => {
-        const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(termo)}`, {
-          credentials: 'same-origin',
-          headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} na consulta de CPF`);
-        const lista = JSON.parse(await resp.text());
-        if (!Array.isArray(lista)) throw new Error('resposta inválida na consulta de CPF');
-        return escolherMunicipe(lista, o);
+        if (o.municipeId) {
+          const peloId = await cpfPeloId(o.municipeId).catch((e) => {
+            warn('Falha ao ler o CPF pelo id:', e);
+            return null;
+          });
+          if (peloId) return peloId;
+          log('CPF pelo id indisponível, usando a busca', o.municipeId);
+        }
+        let resultado = escolherMunicipe([], o);
+        for (const termo of termos) {
+          const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(termo)}`, {
+            credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
+          });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status} na consulta de CPF`);
+          const lista = JSON.parse(await resp.text());
+          if (!Array.isArray(lista)) throw new Error('resposta inválida na consulta de CPF');
+          resultado = escolherMunicipe(lista, o);
+          if (resultado.cpf || resultado.semCpf) break;
+        }
+        return resultado;
       } });
       executarFilaCpf();
     }).catch((e) => {
@@ -1017,7 +1065,10 @@
     const blocoDe = (rotulo) => blocos.find((d) => normalizar(d.querySelector('strong')?.textContent) === rotulo);
     const blocoCns = blocoDe('CODIGO CNS');
     const cns = (blocoCns?.querySelectorAll('li')[1]?.textContent || '').replace(/\D/g, '');
-    const nome = (blocoDe('NOME')?.querySelectorAll('li')[1]?.textContent || '').replace(/\s+/g, ' ').trim();
+    const valorDe = (rotulo) => (blocoDe(rotulo)?.querySelectorAll('li')[1]?.textContent || '').replace(/\s+/g, ' ').trim();
+    const nome = valorDe('NOME');
+    const nascimento = (valorDe('DATA DE NASCIMENTO').match(/\d{2}\/\d{2}\/\d{4}/) || [''])[0];
+    const mae = valorDe('NOME DA MAE');
     const ancora = blocoDe('NOME DA MAE') || blocoDe('DATA DE NASCIMENTO');
     if (!ancora) return;
 
@@ -1032,7 +1083,7 @@
     const depoisDe = ancora.nextElementSibling?.classList.contains('clear') ? ancora.nextElementSibling : ancora;
     depoisDe.after(bloco, limpar);
     if (depoisDe === ancora) bloco.before(Object.assign(document.createElement('div'), { className: 'clear ssvh-cpf-clear' }));
-    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', municipeId, nome }]);
+    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', cnsVazio: !cns, municipeId, nome, nascimento, mae }]);
   }
 
   function observarQuadroMunicipe() {
