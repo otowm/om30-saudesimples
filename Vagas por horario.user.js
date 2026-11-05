@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.14.0
+// @version      1.14.1
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
@@ -904,10 +904,15 @@
   let consultasCpfAtivas = 0;
 
   function escolherMunicipe(lista, o) {
-    if (!/^\d{15}$/.test(o.cns || '')) return { cpf: '', motivo: 'sem CNS na listagem' };
-    const candidatos = lista.filter((m) => String(m.codigo_cns || '').replace(/\D/g, '') === o.cns
-      && (!o.municipeId || String(m.id) === o.municipeId));
-    if (candidatos.length !== 1) return { cpf: '', motivo: 'cadastro não encontrado pelo CNS' };
+    const temCns = /^\d{15}$/.test(o.cns || '');
+    // Sem CNS, só o quadro do munícipe tem como conferir: pelo id do cadastro aberto.
+    if (!temCns && !(o.municipeId && o.nome)) return { cpf: '', motivo: 'sem CNS na listagem' };
+    const candidatos = lista.filter((m) => (temCns
+      ? String(m.codigo_cns || '').replace(/\D/g, '') === o.cns && (!o.municipeId || String(m.id) === o.municipeId)
+      : String(m.id) === o.municipeId));
+    if (candidatos.length !== 1) {
+      return { cpf: '', motivo: temCns ? 'cadastro não encontrado pelo CNS' : 'cadastro não encontrado pelo nome' };
+    }
     const cpf = String(candidatos[0].cpf_numero || '').replace(/\D/g, '');
     if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
     return /^\d{11}$/.test(cpf)
@@ -928,15 +933,17 @@
 
   async function buscarCpf(o) {
     if (!CONFIG.mostrarCpf) return { cpf: '', motivo: 'consulta de CPF desativada' };
-    if (!/^\d{15}$/.test(o.cns || '')) return escolherMunicipe([], o);
-    const chave = `${o.cns}|${o.municipeId || ''}`;
+    const temCns = /^\d{15}$/.test(o.cns || '');
+    if (!temCns && !(o.municipeId && o.nome)) return escolherMunicipe([], o);
+    const termo = temCns ? o.cns : o.nome;
+    const chave = `${temCns ? o.cns : normalizar(o.nome)}|${o.municipeId || ''}`;
     const agora = Date.now();
     const cache = cacheCpf.get(chave);
     if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
 
     const promise = new Promise((resolve, reject) => {
       filaCpf.push({ resolve, reject, executar: async () => {
-        const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(o.cns)}`, {
+        const resp = await fetchComTimeout(`/municipes/search_padronizado_com_mudanca.json?q=${encodeURIComponent(termo)}`, {
           credentials: 'same-origin',
           headers: { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' },
         });
@@ -982,34 +989,50 @@
 
   /* ================ CPF no quadro "Informações do Munícipe" ================ */
 
-  // O quadro mostra o CNS e guarda o id do munícipe num input oculto; o CPF
-  // vem da busca pelo CNS, conferindo que é o mesmo cadastro (mesmo id).
+  // O quadro mostra o CNS; o CPF vem da busca pelo CNS, conferindo que é o
+  // mesmo cadastro (mesmo id). Há duas variantes do quadro: com "Número de
+  // Prontuário" editável (id num input oculto dentro dele) e sem (id fora do
+  // quadro, blocos dentro de um div.form) — o link "Editar Munícipe" vale nas duas.
+  function localizarQuadroMunicipe() {
+    const cabecalho = [...document.querySelectorAll('.content-box .ui-box-header')]
+      .find((h) => normalizar(h.textContent).includes('INFORMACOES DO MUNICIPE'));
+    return cabecalho ? cabecalho.closest('.content-box').querySelector('.content-box-wrapper') : null;
+  }
+
   function inserirCpfNoQuadro() {
     if (!CONFIG.mostrarCpf) return;
-    const idInput = document.getElementById('agendamento_municipe_id');
-    const quadro = idInput && idInput.closest('.content-box-wrapper');
+    const quadro = localizarQuadroMunicipe();
     if (!quadro) return;
-    const municipeId = String(idInput.value || '').trim();
+    const linkEditar = quadro.closest('.content-box').querySelector('a[href*="/municipes/"][href*="/edit"]');
+    const municipeId = String(document.getElementById('agendamento_municipe_id')?.value
+      || linkEditar?.getAttribute('href').match(/\/municipes\/(\d+)\/edit/)?.[1] || '').trim();
     const existente = quadro.querySelector('.ssvh-cpf-quadro');
     if (existente) {
       if (existente.dataset.municipeId === municipeId) return;
       existente.remove();
+      quadro.querySelectorAll('.ssvh-cpf-clear').forEach((el) => el.remove());
     }
 
-    const blocos = [...quadro.querySelectorAll(':scope > div[class*="grid_"]')];
+    const blocos = [...quadro.querySelectorAll('div[class*="grid_"]')].filter((d) => d.querySelector('strong'));
     const blocoDe = (rotulo) => blocos.find((d) => normalizar(d.querySelector('strong')?.textContent) === rotulo);
     const blocoCns = blocoDe('CODIGO CNS');
     const cns = (blocoCns?.querySelectorAll('li')[1]?.textContent || '').replace(/\D/g, '');
+    const nome = (blocoDe('NOME')?.querySelectorAll('li')[1]?.textContent || '').replace(/\s+/g, ' ').trim();
     const ancora = blocoDe('NOME DA MAE') || blocoDe('DATA DE NASCIMENTO');
     if (!ancora) return;
 
+    // Linha própria na coluna da esquerda: a direita pode ter o cartão de lembrete.
     injetarCss();
     const bloco = document.createElement('div');
     bloco.className = 'grid_4 ssvh-cpf-quadro';
     bloco.dataset.municipeId = municipeId;
     bloco.innerHTML = '<li><strong>CPF</strong></li><li data-ssvh-cpf="0">…</li>';
-    ancora.after(bloco);
-    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', municipeId }]);
+    const limpar = document.createElement('div');
+    limpar.className = 'clear ssvh-cpf-clear';
+    const depoisDe = ancora.nextElementSibling?.classList.contains('clear') ? ancora.nextElementSibling : ancora;
+    depoisDe.after(bloco, limpar);
+    if (depoisDe === ancora) bloco.before(Object.assign(document.createElement('div'), { className: 'clear ssvh-cpf-clear' }));
+    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', municipeId, nome }]);
   }
 
   function observarQuadroMunicipe() {
