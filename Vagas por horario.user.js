@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.15.1
+// @version      1.16.0
 // @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
@@ -1029,7 +1029,12 @@
     const existente = quadro.querySelector('.ssvh-cpf-quadro');
     if (existente) {
       if (existente.dataset.municipeId === municipeId) return;
-      existente.remove();
+      // Outro munícipe no mesmo quadro: devolve o cartão provisório ao lugar.
+      const movido = quadro.querySelector('.ssvh-cpf-movido');
+      if (movido) {
+        movido.classList.remove('ssvh-cpf-movido');
+        existente.replaceWith(movido);
+      } else existente.remove();
       quadro.querySelectorAll('.ssvh-cpf-clear').forEach((el) => el.remove());
     }
 
@@ -1044,17 +1049,26 @@
     const ancora = blocoDe('NOME DA MAE') || blocoDe('DATA DE NASCIMENTO');
     if (!ancora) return;
 
-    // Linha própria na coluna da esquerda: a direita pode ter o cartão de lembrete.
+    // O CPF fica no lugar do cartão provisório (1ª linha, ao lado do CNS) e o
+    // cartão provisório desce para uma linha própria na coluna da esquerda,
+    // depois do nome da mãe: a direita pode ter o cartão de lembrete.
     injetarCss();
+    const provisorio = blocoDe('CARTAO PROVISORIO');
     const bloco = document.createElement('div');
-    bloco.className = 'grid_4 ssvh-cpf-quadro';
     bloco.dataset.municipeId = municipeId;
     bloco.innerHTML = '<li><strong>CPF</strong></li><li data-ssvh-cpf="0">…</li>';
+    let paraLinha = bloco;
+    if (provisorio) {
+      bloco.className = `${provisorio.className} ssvh-cpf-quadro`;
+      provisorio.replaceWith(bloco);
+      provisorio.classList.add('ssvh-cpf-movido');
+      paraLinha = provisorio;
+    } else bloco.className = 'grid_4 ssvh-cpf-quadro';
     const limpar = document.createElement('div');
     limpar.className = 'clear ssvh-cpf-clear';
     const depoisDe = ancora.nextElementSibling?.classList.contains('clear') ? ancora.nextElementSibling : ancora;
-    depoisDe.after(bloco, limpar);
-    if (depoisDe === ancora) bloco.before(Object.assign(document.createElement('div'), { className: 'clear ssvh-cpf-clear' }));
+    depoisDe.after(paraLinha, limpar);
+    if (depoisDe === ancora) paraLinha.before(Object.assign(document.createElement('div'), { className: 'clear ssvh-cpf-clear' }));
     preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', cnsVazio: !cns, municipeId, nome, nascimento, mae }]);
   }
 
