@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Saúde Simples - Vagas por horário
 // @namespace    om30.saudesimples.guaruja
-// @version      1.13.0
-// @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres.
+// @version      1.14.0
+// @description  Ao clicar num dia no agendamento, cruza a configuração da agenda (/agendas/ID) com os agendamentos já marcados (/consultar_agendas e /atendimentos_medicos_administrativo) e mostra, em cada horário da lista, quantas vagas existem, quem está em cada uma (com CPF) e quantas estão livres. Também mostra o CPF no quadro Informações do Munícipe.
 // @author       otowm
 // @downloadURL  https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
 // @updateURL    https://raw.githubusercontent.com/otowm/om30-saudesimples/previa/Vagas%20por%20horario.user.js
@@ -905,7 +905,8 @@
 
   function escolherMunicipe(lista, o) {
     if (!/^\d{15}$/.test(o.cns || '')) return { cpf: '', motivo: 'sem CNS na listagem' };
-    const candidatos = lista.filter((m) => String(m.codigo_cns || '').replace(/\D/g, '') === o.cns);
+    const candidatos = lista.filter((m) => String(m.codigo_cns || '').replace(/\D/g, '') === o.cns
+      && (!o.municipeId || String(m.id) === o.municipeId));
     if (candidatos.length !== 1) return { cpf: '', motivo: 'cadastro não encontrado pelo CNS' };
     const cpf = String(candidatos[0].cpf_numero || '').replace(/\D/g, '');
     if (!cpf) return { cpf: '', semCpf: true, motivo: 'cadastro sem CPF' };
@@ -928,7 +929,7 @@
   async function buscarCpf(o) {
     if (!CONFIG.mostrarCpf) return { cpf: '', motivo: 'consulta de CPF desativada' };
     if (!/^\d{15}$/.test(o.cns || '')) return escolherMunicipe([], o);
-    const chave = o.cns;
+    const chave = `${o.cns}|${o.municipeId || ''}`;
     const agora = Date.now();
     const cache = cacheCpf.get(chave);
     if (cache && agora - cache.ts < CONFIG.ttlCacheMs) return cache.promise;
@@ -977,6 +978,52 @@
         if (!cpf) el.title = motivo;
       });
     });
+  }
+
+  /* ================ CPF no quadro "Informações do Munícipe" ================ */
+
+  // O quadro mostra o CNS e guarda o id do munícipe num input oculto; o CPF
+  // vem da busca pelo CNS, conferindo que é o mesmo cadastro (mesmo id).
+  function inserirCpfNoQuadro() {
+    if (!CONFIG.mostrarCpf) return;
+    const idInput = document.getElementById('agendamento_municipe_id');
+    const quadro = idInput && idInput.closest('.content-box-wrapper');
+    if (!quadro) return;
+    const municipeId = String(idInput.value || '').trim();
+    const existente = quadro.querySelector('.ssvh-cpf-quadro');
+    if (existente) {
+      if (existente.dataset.municipeId === municipeId) return;
+      existente.remove();
+    }
+
+    const blocos = [...quadro.querySelectorAll(':scope > div[class*="grid_"]')];
+    const blocoDe = (rotulo) => blocos.find((d) => normalizar(d.querySelector('strong')?.textContent) === rotulo);
+    const blocoCns = blocoDe('CODIGO CNS');
+    const cns = (blocoCns?.querySelectorAll('li')[1]?.textContent || '').replace(/\D/g, '');
+    const ancora = blocoDe('NOME DA MAE') || blocoDe('DATA DE NASCIMENTO');
+    if (!ancora) return;
+
+    injetarCss();
+    const bloco = document.createElement('div');
+    bloco.className = 'grid_4 ssvh-cpf-quadro';
+    bloco.dataset.municipeId = municipeId;
+    bloco.innerHTML = '<li><strong>CPF</strong></li><li data-ssvh-cpf="0">…</li>';
+    ancora.after(bloco);
+    preencherCpfs(bloco, [{ cns: /^\d{15}$/.test(cns) ? cns : '', municipeId }]);
+  }
+
+  function observarQuadroMunicipe() {
+    let agendado = false;
+    const verificar = () => {
+      agendado = false;
+      inserirCpfNoQuadro();
+    };
+    new MutationObserver(() => {
+      if (agendado) return;
+      agendado = true;
+      requestAnimationFrame(verificar);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+    verificar();
   }
 
   /* ====================== Localização da tabela de horários ====================== */
@@ -1923,7 +1970,12 @@
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', iniciarPrefetchConfig, { once: true });
-  } else iniciarPrefetchConfig();
+    document.addEventListener('DOMContentLoaded', observarQuadroMunicipe, { once: true });
+  } else {
+    iniciarPrefetchConfig();
+    observarQuadroMunicipe();
+  }
 
-  console.log(`[Vagas] v1.11.0 ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
+  const versao = typeof GM_info !== 'undefined' ? GM_info.script.version : '?';
+  console.log(`[Vagas] v${versao} ativo em ${AMBIENTE} — aguardando clique num dia da agenda.`);
 })();
