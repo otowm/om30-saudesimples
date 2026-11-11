@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Saúde Simples - CPF na Recepção
 // @namespace    om30.saudesimples.guaruja
-// @version      1.1.0
-// @description  Mostra o CPF no quadro Informações do Munícipe da recepção ambulatorial (/ambulatorial/recepcoes/new), igual ao Vagas por horário faz no agendamento, e avisa quando o munícipe está sem CPF.
+// @version      1.2.1
+// @description  Mostra o CPF no quadro Informações do Munícipe da recepção ambulatorial (/ambulatorial/recepcoes/new), igual ao Vagas por horário faz no agendamento, avisa quando o munícipe está sem CPF e traz os botões Alterar/Gerar do número de prontuário.
 // @author       otowm
 // @match        https://guaruja.saudesimples.net/ambulatorial/recepcoes/new*
 // @match        https://guarujahomolog.saudesimples.net/ambulatorial/recepcoes/new*
@@ -118,6 +118,14 @@
         background: #fdecea; color: #b3261e; border: 1px solid #f3b8b2;
       }
       .sscr-cpf-valor { cursor: copy; }
+      .sspr-btn {
+        display: inline-block; margin-left: 4px; padding: 1px 8px; border-radius: 4px;
+        font: 12px/18px Arial, sans-serif; cursor: pointer; vertical-align: middle;
+        background: #eee; color: #333; border: 1px solid #ccc;
+      }
+      .sspr-btn:hover:not(:disabled) { background: #e0e0e0; }
+      .sspr-btn:disabled { opacity: .6; cursor: wait; }
+      .sspr-input { width: 90px; padding: 1px 4px; font: 13px Arial, sans-serif; vertical-align: middle; }
       .sscr-alerta-sem-cpf {
         display: flex; align-items: center; gap: 10px; margin: 0 0 10px;
         padding: 10px 14px; border-radius: 6px; border: 2px solid #d93025;
@@ -251,10 +259,165 @@
       .then((r) => preencher(valorEl, r, quadro, municipeId));
   }
 
+  /* ================= Número de prontuário: Alterar / Gerar ================= */
+  // Mesmos endpoints da tela de agendamento:
+  //  - Alterar: GET /agendamentos/alterar_numero.json {municipe_id, unidade_saude_id: unidade logada, numero}
+  //    → { status, valor, mensagem }; status 1 já salva. Sem unidade_saude_id o servidor responde "dados inválidos".
+  //  - Gerar: GET /prontuarios_numeracoes_atuais.json {municipe_id, unidade_saude_id}
+  //    → { status: 1, mensagem: número } ou { status != 1, mensagem: erro }. Só existe em unidade
+  //    com numeração sequencial (unidade_numeracoes_atuais → true). Depois de gerar, confere no
+  //    /agendamentos/new se o número ficou mesmo no cadastro.
+
+  const jsonHeaders = { 'X-Requested-With': 'XMLHttpRequest', 'Accept': 'application/json' };
+
+  async function getJson(url) {
+    const resp = await fetchComTimeout(url, { credentials: 'same-origin', headers: jsonHeaders });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const texto = await resp.text();
+    try { return JSON.parse(texto); } catch { throw new Error('resposta inválida'); }
+  }
+
+  let unidadePromise = null;
+  // Id da unidade logada: a recepção não traz o id, só o nome no topo; busca pelo nome exato.
+  function unidadeAtual() {
+    if (unidadePromise) return unidadePromise;
+    const nome = document.querySelector('.unidade-saude-atual')?.textContent.replace(/\s+/g, ' ').trim() || '';
+    unidadePromise = (async () => {
+      if (!nome) return null;
+      const lista = await getJson(`/unidades_saude/search.json?q=${encodeURIComponent(nome)}`);
+      const achada = (Array.isArray(lista) ? lista : []).filter((u) => normalizar(u.nome) === normalizar(nome));
+      if (achada.length !== 1) return null;
+      const id = String(achada[0].id || achada[0]._id || '');
+      if (!id) return null;
+      const seq = await getJson(`/ferramentas/prontuario/gerar_numeracoes_atuais/unidade_numeracoes_atuais?unidade_saude_id=${id}`);
+      return { id, nome, sequencial: seq === true };
+    })().catch((e) => {
+      warn('Falha ao identificar a unidade:', e);
+      unidadePromise = null;
+      return null;
+    });
+    return unidadePromise;
+  }
+
+  async function numeroNoCadastro(municipeId) {
+    const resp = await fetchComTimeout(`/agendamentos/new?municipe_id=${encodeURIComponent(municipeId)}`, { credentials: 'same-origin' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const doc = new DOMParser().parseFromString(await resp.text(), 'text/html');
+    return (doc.getElementById('agendamento_alterar_numeracao')?.value || '').trim();
+  }
+
+  function botao(texto, titulo, aoClicar) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'sspr-btn';
+    b.textContent = texto;
+    b.title = titulo;
+    b.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); aoClicar(b); });
+    return b;
+  }
+
+  function desenharProntuario(p, municipeId, numero) {
+    p.textContent = '';
+    p.append(document.createTextNode(numero || '—'));
+    if (numero) {
+      p.append(' ', botao('Alterar', 'Alterar o número de prontuário (salva na hora)', () => editarProntuario(p, municipeId, numero)));
+      return;
+    }
+    const espaco = document.createElement('span');
+    p.append(' ', espaco);
+    unidadeAtual().then((u) => {
+      if (!espaco.isConnected || !u?.sequencial) return;
+      espaco.replaceWith(botao('Gerar', `Gerar número de prontuário na unidade ${u.nome}`, (b) => gerarProntuario(p, municipeId, u, b)));
+    });
+  }
+
+  function editarProntuario(p, municipeId, numeroAtual) {
+    p.textContent = '';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.maxLength = 30;
+    input.value = numeroAtual;
+    input.className = 'sspr-input';
+    const ok = botao('OK', 'Salvar o novo número', async () => {
+      const numero = input.value.trim();
+      if (!numero) { alert('O número de prontuário não pode ficar em branco.'); return; }
+      ok.disabled = true; cancelar.disabled = true; input.disabled = true;
+      try {
+        const unidade = await unidadeAtual();
+        if (!unidade?.id) throw new Error('unidade logada não identificada');
+        const qs = new URLSearchParams({ municipe_id: municipeId, unidade_saude_id: unidade.id, numero });
+        const r = await getJson(`/agendamentos/alterar_numero.json?${qs}`);
+        if (r?.mensagem) alert(r.mensagem);
+        // status 1 = salvo; status 0 = recusado (ex.: número em conflito) e "valor" volta com o número antigo.
+        desenharProntuario(p, municipeId, String(r?.valor ?? '').trim() || numeroAtual);
+      } catch (e) {
+        warn('Falha ao alterar prontuário:', e);
+        alert(`Ocorreu um erro ao atualizar o número de prontuário (${e.message}). Tente novamente.`);
+        ok.disabled = false; cancelar.disabled = false; input.disabled = false;
+      }
+    });
+    const cancelar = botao('✕', 'Cancelar', () => desenharProntuario(p, municipeId, numeroAtual));
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); ok.click(); }
+      if (ev.key === 'Escape') { ev.preventDefault(); cancelar.click(); }
+    });
+    p.append(input, ' ', ok, ' ', cancelar);
+    input.focus();
+    input.select();
+  }
+
+  async function gerarProntuario(p, municipeId, unidade, b) {
+    if (!confirm(`Gerar um número de prontuário para este munícipe na unidade ${unidade.nome}?`)) return;
+    b.disabled = true;
+    b.textContent = 'Gerando…';
+    try {
+      const qs = new URLSearchParams({ municipe_id: municipeId, unidade_saude_id: unidade.id });
+      const r = await getJson(`/prontuarios_numeracoes_atuais.json?${qs}`);
+      if (Number(r?.status) !== 1) {
+        alert(r?.mensagem || 'Não foi possível gerar o número de prontuário.');
+        b.disabled = false; b.textContent = 'Gerar';
+        return;
+      }
+      const gerado = String(r.mensagem || '').trim();
+      desenharProntuario(p, municipeId, gerado);
+      let salvo = '';
+      try { salvo = await numeroNoCadastro(municipeId); } catch (e) { warn('Falha ao conferir prontuário:', e); }
+      if (salvo !== gerado) {
+        const aviso = document.createElement('span');
+        aviso.className = 'sscr-sem-cpf';
+        aviso.textContent = 'NÃO CONFIRMADO';
+        aviso.title = salvo
+          ? `O cadastro mostra ${salvo}, não ${gerado}.`
+          : 'O número foi gerado, mas não apareceu no cadastro do munícipe. Confira pelo agendamento.';
+        p.append(' ', aviso);
+      }
+    } catch (e) {
+      warn('Falha ao gerar prontuário:', e);
+      alert('Ocorreu um erro ao gerar o número de prontuário. Tente novamente.');
+      b.disabled = false; b.textContent = 'Gerar';
+    }
+  }
+
+  function inserirAcoesProntuario() {
+    const quadro = localizarQuadroMunicipe();
+    if (!quadro) return;
+    const municipeId = municipeIdAtual(quadro);
+    if (!/^\d+$/.test(municipeId)) return;
+    const bloco = [...quadro.querySelectorAll('div[class*="grid_"]')]
+      .find((d) => normalizar(d.querySelector(':scope > b')?.textContent) === 'NUMERO DE PRONTUARIO');
+    const p = bloco?.querySelector('p');
+    if (!p || bloco.dataset.ssprMunicipe === municipeId) return;
+    bloco.dataset.ssprMunicipe = municipeId;
+    injetarCss();
+    const numero = p.textContent.replace(/\s+/g, ' ').trim();
+    desenharProntuario(p, municipeId, /^[—-]?$/.test(numero) ? '' : numero);
+  }
+
   let agendado = false;
   const verificar = () => {
     agendado = false;
     inserirCpfNoQuadro();
+    inserirAcoesProntuario();
   };
   new MutationObserver(() => {
     if (agendado) return;
