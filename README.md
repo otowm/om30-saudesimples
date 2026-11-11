@@ -45,6 +45,12 @@ Facilita a ficha de aplicação de vacinas: profissional e local preenchidos, bu
 
 ---
 
+### 🪪 [CPF na Recepção](https://github.com/otowm/om30-saudesimples/raw/refs/heads/main/Sa%C3%BAde%20Simples%20-%20CPF%20na%20Recep%C3%A7%C3%A3o.user.js)
+
+Mostra o CPF no quadro Informações do Munícipe da recepção ambulatorial (clique para copiar) e exibe um aviso em vermelho quando o munícipe está sem CPF cadastrado, com link para editar o cadastro.
+
+---
+
 ## ⚙️ Como instalar
 
 1. Instale o Tampermonkey no seu navegador (links acima)
